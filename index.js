@@ -385,6 +385,26 @@ function extractSchoolIdFromExternalReference(externalReference) {
   return candidate;
 }
 
+// Extrae el planId del external_reference con formato "PLAN_ID_<24hexSchoolId>"
+function extractPlanIdFromExternalReference(externalReference) {
+  if (!externalReference) return null;
+  const ref = String(externalReference);
+  const schoolId = extractSchoolIdFromExternalReference(ref);
+  if (!schoolId) return null;
+  // planId es todo lo que está antes de "_<schoolId>"
+  const planId = ref.slice(0, ref.length - schoolId.length - 1);
+  return planId || null;
+}
+
+// Deriva billingCycle del campo reason (ej: "FlyBoty LOW_COST · Anual")
+function extractBillingCycleFromReason(reason) {
+  if (!reason) return null;
+  const r = String(reason).toLowerCase();
+  if (r.includes("anual")) return "annual";
+  if (r.includes("mensual")) return "monthly";
+  return null;
+}
+
 function mapSubscriptionStatus(status) {
   switch (status) {
     case "authorized":
@@ -525,6 +545,19 @@ async function updateSchoolFromSubscription({
   const receivedAt = new Date();
   const db = await getMongoDb();
 
+  const parsedPlanId = extractPlanIdFromExternalReference(externalReference);
+  const parsedBillingCycle = extractBillingCycleFromReason(result?.reason);
+  const nextPaymentDate = result?.next_payment_date
+    ? new Date(result.next_payment_date)
+    : result?.auto_recurring?.end_date
+    ? new Date(result.auto_recurring.end_date)
+    : null;
+
+  const planFields = {};
+  if (parsedPlanId) planFields.planName = parsedPlanId;
+  if (parsedBillingCycle) planFields.billingCycle = parsedBillingCycle;
+  if (nextPaymentDate) planFields.subscriptionNextPaymentDate = nextPaymentDate;
+
   await db.collection("schools").updateOne(
     { _id: resolved.school._id },
     {
@@ -542,6 +575,7 @@ async function updateSchoolFromSubscription({
         mercadoPagoSubscriptionVersion: context.version,
         mercadoPagoSubscriptionLastEventAt: new Date(eventDate),
         subscriptionStatus: mapSubscriptionStatus(result?.status),
+        ...planFields,
         updatedAt: new Date(),
       },
       $push: {
