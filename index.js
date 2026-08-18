@@ -7,13 +7,10 @@ import {
   PreApproval,
 } from "mercadopago";
 
-const config = loadConfig();
-validateConfig(config);
-
-const mpClient = new MercadoPagoConfig({ accessToken: config.mpAccessToken });
-const paymentClient = new Payment(mpClient);
-const preApprovalClient = new PreApproval(mpClient);
-const invoiceClient = new Invoice(mpClient);
+let config;
+let paymentClient;
+let preApprovalClient;
+let invoiceClient;
 
 const mongoState = {
   client: null,
@@ -22,35 +19,47 @@ const mongoState = {
   indexesReady: false,
 };
 
-function loadConfig() {
+function loadConfig(values = process.env) {
   return {
-    nodeEnv: process.env.ENVIRONMENT || process.env.NODE_ENV || "development",
-    trustProxy: parseProxyValue(process.env.TRUST_PROXY),
-    requireHttps: parseBoolean(process.env.REQUIRE_HTTPS, false),
-    maxBodySize: process.env.MAX_BODY_SIZE || "32kb",
+    nodeEnv: values.ENVIRONMENT || values.NODE_ENV || "development",
+    gatewaySharedSecret: values.GATEWAY_SHARED_SECRET || "",
+    trustProxy: parseProxyValue(values.TRUST_PROXY),
+    requireHttps: parseBoolean(values.REQUIRE_HTTPS, false),
+    maxBodySize: values.MAX_BODY_SIZE || "32kb",
     signatureMaxAgeSeconds: parseInteger(
-      process.env.SIGNATURE_MAX_AGE_SECONDS,
+      values.SIGNATURE_MAX_AGE_SECONDS,
       300
     ),
     webhookRateLimit: {
-      windowMs: parseInteger(process.env.WEBHOOK_RATE_LIMIT_WINDOW_MS, 60000),
-      max: parseInteger(process.env.WEBHOOK_RATE_LIMIT_MAX, 120),
+      windowMs: parseInteger(values.WEBHOOK_RATE_LIMIT_WINDOW_MS, 60000),
+      max: parseInteger(values.WEBHOOK_RATE_LIMIT_MAX, 120),
     },
     healthRateLimit: {
-      windowMs: parseInteger(process.env.HEALTH_RATE_LIMIT_WINDOW_MS, 60000),
-      max: parseInteger(process.env.HEALTH_RATE_LIMIT_MAX, 30),
+      windowMs: parseInteger(values.HEALTH_RATE_LIMIT_WINDOW_MS, 60000),
+      max: parseInteger(values.HEALTH_RATE_LIMIT_MAX, 30),
     },
     webhookEventRetentionDays: parseInteger(
-      process.env.WEBHOOK_EVENT_RETENTION_DAYS,
+      values.WEBHOOK_EVENT_RETENTION_DAYS,
       90
     ),
-    logWebhookPayloads: parseBoolean(process.env.LOG_WEBHOOK_PAYLOADS, false),
-    allowedWebhookIps: parseCsv(process.env.ALLOWED_WEBHOOK_IPS),
-    mongodbUri: process.env.MONGODB_URI,
-    mongodbDb: process.env.MONGODB_DB || "FlyBotyInstruccion",
-    mpAccessToken: process.env.MP_ACCESS_TOKEN,
-    mpWebhookSecret: process.env.MP_WEBHOOK_SECRET,
+    logWebhookPayloads: parseBoolean(values.LOG_WEBHOOK_PAYLOADS, false),
+    allowedWebhookIps: parseCsv(values.ALLOWED_WEBHOOK_IPS),
+    mongodbUri: values.MONGODB_URI,
+    mongodbDb: values.MONGODB_DB || "FlyBotyInstruccion",
+    mpAccessToken: values.MP_ACCESS_TOKEN,
+    mpWebhookSecret: values.MP_WEBHOOK_SECRET,
   };
+}
+
+function initialize(values) {
+  if (config) return;
+  const loadedConfig = loadConfig(values);
+  validateConfig(loadedConfig);
+  const mpClient = new MercadoPagoConfig({ accessToken: loadedConfig.mpAccessToken });
+  paymentClient = new Payment(mpClient);
+  preApprovalClient = new PreApproval(mpClient);
+  invoiceClient = new Invoice(mpClient);
+  config = loadedConfig;
 }
 
 function validateConfig(currentConfig) {
@@ -878,7 +887,7 @@ function constantTimeEqual(left, right) {
 }
 
 function isGatewayAuthorized(request) {
-  const expected = process.env.GATEWAY_SHARED_SECRET || "";
+  const expected = config.gatewaySharedSecret;
   if (!expected) return config.nodeEnv !== "production";
   return constantTimeEqual(request.headers.get("x-gateway-secret") || "", expected);
 }
@@ -913,7 +922,14 @@ async function workerRequest(request) {
 }
 
 export default {
-  async fetch(request, _env, ctx) {
+  async fetch(request, env, ctx) {
+    try {
+      initialize(env);
+    } catch (error) {
+      console.error("[config] Worker no configurado:", error.message);
+      return workerJson({ error: "Servicio no configurado" }, 503);
+    }
+
     const url = new URL(request.url);
 
     if (request.method === "POST" && url.pathname === "/webhook/mercadopago") {
