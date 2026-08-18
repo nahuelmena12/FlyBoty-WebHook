@@ -1,9 +1,4 @@
 import crypto from "node:crypto";
-import http from "node:http";
-import { httpServerHandler } from "cloudflare:node";
-import express from "express";
-import helmet from "helmet";
-import rateLimit from "express-rate-limit";
 import { MongoClient, ObjectId } from "mongodb";
 import {
   Invoice,
@@ -14,64 +9,6 @@ import {
 
 const config = loadConfig();
 validateConfig(config);
-
-const app = express();
-app.disable("x-powered-by");
-app.set("trust proxy", config.trustProxy);
-
-app.use((req, res, next) => {
-  // Mercado Pago calls this public endpoint directly. Its x-signature is
-  // validated in the route below; it must not be required to know our gateway secret.
-  if (req.method === "POST" && req.path === "/webhook/mercadopago") return next();
-
-  const expected = process.env.GATEWAY_SHARED_SECRET || "";
-  if (!expected) {
-    if (config.nodeEnv === "production") return res.status(503).json({ error: "Gateway not configured" });
-    return next();
-  }
-  const received = req.get("x-gateway-secret") || "";
-  if (received.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(received), Buffer.from(expected))) {
-    return res.status(403).json({ error: "Direct access denied" });
-  }
-  next();
-});
-
-app.use(
-  helmet({
-    contentSecurityPolicy: false,
-    crossOriginEmbedderPolicy: false,
-    referrerPolicy: { policy: "no-referrer" },
-    hsts: config.requireHttps
-      ? { maxAge: 31536000, includeSubDomains: true, preload: true }
-      : false,
-  })
-);
-
-app.use(express.json({ limit: config.maxBodySize, type: "application/json" }));
-app.use(express.urlencoded({ extended: false, limit: config.maxBodySize }));
-
-if (config.requireHttps) {
-  app.use((req, res, next) => {
-    if (req.secure || req.headers["x-forwarded-proto"] === "https") {
-      return next();
-    }
-
-    if (req.method === "GET" || req.method === "HEAD") {
-      const host = req.headers.host || "localhost";
-      return res.redirect(301, `https://${host}${req.originalUrl}`);
-    }
-
-    return res.status(426).json({ error: "HTTPS requerido" });
-  });
-}
-
-app.use("/health", buildRateLimiter("health", config.healthRateLimit));
-app.use("/webhook/mercadopago", buildRateLimiter("webhook", config.webhookRateLimit));
-
-app.use((req, _res, next) => {
-  req.requestId = crypto.randomUUID();
-  next();
-});
 
 const mpClient = new MercadoPagoConfig({ accessToken: config.mpAccessToken });
 const paymentClient = new Payment(mpClient);
@@ -159,16 +96,6 @@ function parseProxyValue(value) {
 
   const numeric = Number.parseInt(value, 10);
   return Number.isFinite(numeric) ? numeric : value;
-}
-
-function buildRateLimiter(name, options) {
-  return rateLimit({
-    windowMs: options.windowMs,
-    max: options.max,
-    standardHeaders: true,
-    legacyHeaders: false,
-    message: { error: `Rate limit excedido para ${name}` },
-  });
 }
 
 function sanitizeHeaders(headers) {
@@ -807,25 +734,19 @@ async function handleAuthorizedPaymentEvent(id, context) {
   });
 }
 
-app.post("/webhook/mercadopago", async (req, res) => {
+async function processWebhook(req) {
   logWebhookRequest(req);
-
-  if (!req.is("application/json")) {
-    return res.status(415).json({ error: "Content-Type debe ser application/json" });
-  }
 
   if (config.allowedWebhookIps.length > 0) {
     const sourceIp = getRequestIp(req);
     if (!config.allowedWebhookIps.includes(sourceIp)) {
       console.warn(`[webhook] IP no permitida: ${sourceIp}`);
-      return res.status(403).json({ error: "IP no permitida" });
+      return;
     }
   }
 
   const context = buildEventContext(req);
   const signatureResult = validateSignature(req);
-
-  res.status(200).json({ received: true });
 
   if (!signatureResult.valid) {
     console.warn(
@@ -918,26 +839,97 @@ app.post("/webhook/mercadopago", async (req, res) => {
       console.error("[webhook] Error guardando auditoria:", auditErr.message);
     }
   }
-});
+}
 
-app.get("/health", async (_req, res) => {
+async function healthResponse() {
   try {
     await getMongoDb();
-    return res.json({
+    return workerJson({
       status: "ok",
       mongo: "connected",
       https: "managed_by_cloudflare",
     });
   } catch (_err) {
-    return res.status(503).json({
+    return workerJson({
       status: "error",
       mongo: "unavailable",
       https: "managed_by_cloudflare",
-    });
+    }, 503);
   }
-});
+}
 
-// Cloudflare maps incoming requests to this Node HTTP server. The port is only
-// an internal routing key, not a public port that needs to be opened.
-const server = http.createServer(app);
-export default httpServerHandler(server);
+function workerJson(body, status = 200) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
+    },
+  });
+}
+
+function constantTimeEqual(left, right) {
+  if (!left || !right || left.length !== right.length) return false;
+  let difference = 0;
+  for (let index = 0; index < left.length; index += 1) {
+    difference |= left.charCodeAt(index) ^ right.charCodeAt(index);
+  }
+  return difference === 0;
+}
+
+function isGatewayAuthorized(request) {
+  const expected = process.env.GATEWAY_SHARED_SECRET || "";
+  if (!expected) return config.nodeEnv !== "production";
+  return constantTimeEqual(request.headers.get("x-gateway-secret") || "", expected);
+}
+
+async function workerRequest(request) {
+  const url = new URL(request.url);
+  const contentType = request.headers.get("content-type") || "";
+  if (!contentType.toLowerCase().startsWith("application/json")) {
+    return { error: workerJson({ error: "Content-Type debe ser application/json" }, 415) };
+  }
+
+  const declaredLength = Number(request.headers.get("content-length") || 0);
+  if (declaredLength > 32 * 1024) {
+    return { error: workerJson({ error: "Payload demasiado grande" }, 413) };
+  }
+
+  const body = await request.json().catch(() => null);
+  if (!body || typeof body !== "object") {
+    return { error: workerJson({ error: "El cuerpo debe ser JSON válido" }, 400) };
+  }
+
+  const headers = Object.fromEntries(request.headers.entries());
+  return {
+    req: {
+      headers,
+      query: Object.fromEntries(url.searchParams.entries()),
+      body,
+      requestId: crypto.randomUUID(),
+      ip: headers["cf-connecting-ip"] || headers["x-forwarded-for"]?.split(",")[0].trim() || "unknown",
+    },
+  };
+}
+
+export default {
+  async fetch(request, _env, ctx) {
+    const url = new URL(request.url);
+
+    if (request.method === "POST" && url.pathname === "/webhook/mercadopago") {
+      const parsed = await workerRequest(request);
+      if (parsed.error) return parsed.error;
+      // Mercado Pago only needs an acknowledgement. Keep the database/API work
+      // alive after responding, so retries are not caused by normal processing time.
+      ctx.waitUntil(processWebhook(parsed.req));
+      return workerJson({ received: true });
+    }
+
+    if (request.method === "GET" && url.pathname === "/health") {
+      if (!isGatewayAuthorized(request)) return workerJson({ error: "Acceso directo denegado" }, 403);
+      return healthResponse();
+    }
+
+    return workerJson({ error: "Ruta no encontrada" }, 404);
+  },
+};
