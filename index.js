@@ -22,6 +22,19 @@ const app = express();
 app.disable("x-powered-by");
 app.set("trust proxy", config.trustProxy);
 
+app.use((req, res, next) => {
+  const expected = process.env.GATEWAY_SHARED_SECRET || "";
+  if (!expected) {
+    if (config.nodeEnv === "production") return res.status(503).json({ error: "Gateway not configured" });
+    return next();
+  }
+  const received = req.get("x-gateway-secret") || "";
+  if (received.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(received), Buffer.from(expected))) {
+    return res.status(403).json({ error: "Direct access denied" });
+  }
+  next();
+});
+
 app.use(
   helmet({
     contentSecurityPolicy: false,
@@ -957,7 +970,7 @@ function startServers() {
     };
 
     mainServer = https.createServer(sslOptions, app);
-    mainServer.listen(config.httpsPort, () => {
+    mainServer.listen(config.httpsPort, process.env.HOST || "127.0.0.1", () => {
       console.log(`Webhook HTTPS escuchando en https://localhost:${config.httpsPort}`);
       console.log(
         `  POST https://localhost:${config.httpsPort}/webhook/mercadopago`
@@ -973,12 +986,12 @@ function startServers() {
       res.end();
     });
 
-    redirectServer.listen(config.port, () => {
+    redirectServer.listen(config.port, process.env.HOST || "127.0.0.1", () => {
       console.log(`Redireccion HTTP -> HTTPS activa en http://localhost:${config.port}`);
     });
   } else {
     mainServer = http.createServer(app);
-    mainServer.listen(config.port, () => {
+    mainServer.listen(config.port, process.env.HOST || "127.0.0.1", () => {
       console.log(`Webhook escuchando en http://localhost:${config.port}`);
       console.log(`  POST http://localhost:${config.port}/webhook/mercadopago`);
       console.log(`  GET  http://localhost:${config.port}/health`);
