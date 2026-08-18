@@ -1,0 +1,10 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "flyboty-mercadopago-webhook",
+  "main": "index.js",
+  "compatibility_date": "2026-08-18",
+  "compatibility_flags": ["nodejs_compat", "enable_nodejs_http_server_modules"],
+  "workers_dev": true,
+  "placement": { "mode": "smart" },
+  "observability": { "enabled": true }
+}

@@ -1,19 +1,16 @@
-require("dotenv").config();
-
-const crypto = require("crypto");
-const fs = require("fs");
-const http = require("http");
-const https = require("https");
-const express = require("express");
-const helmet = require("helmet");
-const rateLimit = require("express-rate-limit");
-const { MongoClient, ObjectId } = require("mongodb");
-const {
+import crypto from "node:crypto";
+import http from "node:http";
+import { httpServerHandler } from "cloudflare:node";
+import express from "express";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
+import { MongoClient, ObjectId } from "mongodb";
+import {
   Invoice,
   MercadoPagoConfig,
   Payment,
   PreApproval,
-} = require("mercadopago");
+} from "mercadopago";
 
 const config = loadConfig();
 validateConfig(config);
@@ -23,6 +20,10 @@ app.disable("x-powered-by");
 app.set("trust proxy", config.trustProxy);
 
 app.use((req, res, next) => {
+  // Mercado Pago calls this public endpoint directly. Its x-signature is
+  // validated in the route below; it must not be required to know our gateway secret.
+  if (req.method === "POST" && req.path === "/webhook/mercadopago") return next();
+
   const expected = process.env.GATEWAY_SHARED_SECRET || "";
   if (!expected) {
     if (config.nodeEnv === "production") return res.status(503).json({ error: "Gateway not configured" });
@@ -86,12 +87,7 @@ const mongoState = {
 
 function loadConfig() {
   return {
-    nodeEnv: process.env.NODE_ENV || "development",
-    port: parseInteger(process.env.PORT, 3400),
-    httpsPort: parseInteger(process.env.HTTPS_PORT, 3443),
-    httpsEnabled: parseBoolean(process.env.HTTPS_ENABLED, false),
-    sslKeyPath: process.env.SSL_KEY_PATH || "",
-    sslCertPath: process.env.SSL_CERT_PATH || "",
+    nodeEnv: process.env.ENVIRONMENT || process.env.NODE_ENV || "development",
     trustProxy: parseProxyValue(process.env.TRUST_PROXY),
     requireHttps: parseBoolean(process.env.REQUIRE_HTTPS, false),
     maxBodySize: process.env.MAX_BODY_SIZE || "32kb",
@@ -131,22 +127,6 @@ function validateConfig(currentConfig) {
 
   if (!currentConfig.mongodbUri) {
     throw new Error("Falta MONGODB_URI en el .env");
-  }
-
-  if (currentConfig.httpsEnabled) {
-    if (!currentConfig.sslKeyPath || !currentConfig.sslCertPath) {
-      throw new Error(
-        "HTTPS_ENABLED=true requiere SSL_KEY_PATH y SSL_CERT_PATH en el .env"
-      );
-    }
-
-    if (!fs.existsSync(currentConfig.sslKeyPath)) {
-      throw new Error(`No existe SSL_KEY_PATH: ${currentConfig.sslKeyPath}`);
-    }
-
-    if (!fs.existsSync(currentConfig.sslCertPath)) {
-      throw new Error(`No existe SSL_CERT_PATH: ${currentConfig.sslCertPath}`);
-    }
   }
 
   if (currentConfig.signatureMaxAgeSeconds < 30) {
@@ -946,93 +926,18 @@ app.get("/health", async (_req, res) => {
     return res.json({
       status: "ok",
       mongo: "connected",
-      https: config.httpsEnabled || config.requireHttps ? "enabled" : "disabled",
+      https: "managed_by_cloudflare",
     });
   } catch (_err) {
     return res.status(503).json({
       status: "error",
       mongo: "unavailable",
-      https: config.httpsEnabled || config.requireHttps ? "enabled" : "disabled",
+      https: "managed_by_cloudflare",
     });
   }
 });
 
-function startServers() {
-  let mainServer;
-  let redirectServer = null;
-
-  if (config.httpsEnabled) {
-    const sslOptions = {
-      key: fs.readFileSync(config.sslKeyPath),
-      cert: fs.readFileSync(config.sslCertPath),
-      minVersion: "TLSv1.2",
-      honorCipherOrder: true,
-    };
-
-    mainServer = https.createServer(sslOptions, app);
-    mainServer.listen(config.httpsPort, process.env.HOST || "127.0.0.1", () => {
-      console.log(`Webhook HTTPS escuchando en https://localhost:${config.httpsPort}`);
-      console.log(
-        `  POST https://localhost:${config.httpsPort}/webhook/mercadopago`
-      );
-      console.log(`  GET  https://localhost:${config.httpsPort}/health`);
-    });
-
-    redirectServer = http.createServer((req, res) => {
-      const host = (req.headers.host || "localhost").replace(/:\d+$/, "");
-      res.writeHead(301, {
-        Location: `https://${host}:${config.httpsPort}${req.url}`,
-      });
-      res.end();
-    });
-
-    redirectServer.listen(config.port, process.env.HOST || "127.0.0.1", () => {
-      console.log(`Redireccion HTTP -> HTTPS activa en http://localhost:${config.port}`);
-    });
-  } else {
-    mainServer = http.createServer(app);
-    mainServer.listen(config.port, process.env.HOST || "127.0.0.1", () => {
-      console.log(`Webhook escuchando en http://localhost:${config.port}`);
-      console.log(`  POST http://localhost:${config.port}/webhook/mercadopago`);
-      console.log(`  GET  http://localhost:${config.port}/health`);
-    });
-  }
-
-  return { mainServer, redirectServer };
-}
-
-async function bootstrap() {
-  await getMongoDb();
-  const { mainServer, redirectServer } = startServers();
-
-  const shutdown = async (signal) => {
-    console.log(`Cerrando webhook (${signal})`);
-
-    if (redirectServer) {
-      await new Promise((resolve) => redirectServer.close(resolve));
-    }
-
-    await new Promise((resolve) => mainServer.close(resolve));
-    await closeMongo();
-    process.exit(0);
-  };
-
-  process.on("SIGINT", () => {
-    shutdown("SIGINT").catch((err) => {
-      console.error("Error cerrando servidor:", err.message);
-      process.exit(1);
-    });
-  });
-
-  process.on("SIGTERM", () => {
-    shutdown("SIGTERM").catch((err) => {
-      console.error("Error cerrando servidor:", err.message);
-      process.exit(1);
-    });
-  });
-}
-
-bootstrap().catch((err) => {
-  console.error("No se pudo iniciar el webhook:", err.message);
-  process.exit(1);
-});
+// Cloudflare maps incoming requests to this Node HTTP server. The port is only
+// an internal routing key, not a public port that needs to be opened.
+const server = http.createServer(app);
+export default httpServerHandler(server);
