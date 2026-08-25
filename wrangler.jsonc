@@ -4,6 +4,7 @@
   "main": "index.js",
   "compatibility_date": "2026-08-18",
   "compatibility_flags": ["nodejs_compat", "enable_nodejs_http_server_modules"],
+  "limits": { "cpu_ms": 30000 },
   "workers_dev": true,
   "placement": { "mode": "smart" },
   "observability": { "enabled": true }

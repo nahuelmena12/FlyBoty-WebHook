@@ -1,16 +1,9 @@
 import crypto from "node:crypto";
 import { MongoClient, ObjectId } from "mongodb";
-import {
-  Invoice,
-  MercadoPagoConfig,
-  Payment,
-  PreApproval,
-} from "mercadopago";
+
+const MERCADO_PAGO_API = "https://api.mercadopago.com";
 
 let config;
-let paymentClient;
-let preApprovalClient;
-let invoiceClient;
 
 const mongoState = {
   client: null,
@@ -55,11 +48,26 @@ function initialize(values) {
   if (config) return;
   const loadedConfig = loadConfig(values);
   validateConfig(loadedConfig);
-  const mpClient = new MercadoPagoConfig({ accessToken: loadedConfig.mpAccessToken });
-  paymentClient = new Payment(mpClient);
-  preApprovalClient = new PreApproval(mpClient);
-  invoiceClient = new Invoice(mpClient);
   config = loadedConfig;
+}
+
+// El SDK oficial "mercadopago" depende de node-fetch internamente
+// (response.headers.raw()), que no existe en el runtime de Cloudflare
+// Workers. Se llama a la API REST directo con fetch nativo.
+async function mercadoPagoGet(path) {
+  const response = await fetch(`${MERCADO_PAGO_API}${path}`, {
+    headers: { authorization: `Bearer ${config.mpAccessToken}` },
+  });
+  const payload = await response.json().catch(() => null);
+  if (!response.ok) {
+    const error = new Error(
+      payload?.message || payload?.error || `Mercado Pago respondió ${response.status}`
+    );
+    error.status = response.status;
+    error.payload = payload;
+    throw error;
+  }
+  return payload;
 }
 
 function validateConfig(currentConfig) {
@@ -665,7 +673,7 @@ async function updateSchoolFromAuthorizedPayment({
 }
 
 async function handlePaymentEvent(id, context) {
-  const result = await paymentClient.get({ id });
+  const result = await mercadoPagoGet(`/v1/payments/${id}`);
   const {
     status,
     status_detail: statusDetail,
@@ -696,7 +704,7 @@ async function handlePaymentEvent(id, context) {
 }
 
 async function handleSubscriptionEvent(id, context) {
-  const result = await preApprovalClient.get({ id });
+  const result = await mercadoPagoGet(`/preapproval/${id}`);
   const {
     status,
     reason,
@@ -724,7 +732,7 @@ async function handleSubscriptionEvent(id, context) {
 }
 
 async function handleAuthorizedPaymentEvent(id, context) {
-  const result = await invoiceClient.get({ id });
+  const result = await mercadoPagoGet(`/authorized_payments/${id}`);
 
   console.log("[authorized_payment] ID:", id);
   console.log(
