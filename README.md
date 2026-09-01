@@ -30,6 +30,16 @@ En **Workers & Pages > flyboty-mercadopago-webhook > Settings > Variables and Se
 
 Cloudflare gestiona HTTPS y certificados. No configures `PORT`, `HOST`, `HTTPS_ENABLED`, `SSL_KEY_PATH` ni `SSL_CERT_PATH`.
 
+## Activación de licencia
+
+El webhook guarda la preaprobación como trazabilidad, pero no concede acceso por su estado authorized. La licencia se habilita solamente después de consultar el recurso payment y confirmar que su estado es approved, que corresponde a la preaprobación y que coincide con la referencia, moneda e importe generados por el servidor. Los estados pending, canceled/cancelled, rejected, paused, refunded y charged_back nunca activan una licencia.
+
+Las referencias nuevas usan el formato versionado `flyboty:v2:...`; incluyen el plan, ciclo, capacidad e importe calculados por el Worker. Al aprobarse el pago, el webhook aplica esos alumnos extra y `maxStudents` de forma atómica. No expongas una ruta administrativa que modifique la capacidad directamente.
+
+Configurá en Mercado Pago los tópicos payment, subscription_preapproval y subscription_authorized_payment. El tópico payment es la fuente de verdad para acreditar cada cobro.
+
+Las referencias históricas `v1` y `PLAN_<schoolId>` se procesan sólo como auditoría: no pueden otorgar acceso ni capacidad. Una baja histórica se aplica únicamente si su `preapproval_id` coincide exactamente con el ID ya guardado en la escuela. Antes del deploy, verificá o completá `mercadoPagoSubscriptionId`/`mercadoPagoActiveSubscriptionId` para las suscripciones antiguas que deban seguir pudiendo darse de baja.
+
 ## Deploy
 
 ```bash

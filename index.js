@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import { MongoClient, ObjectId } from "mongodb";
 
 const MERCADO_PAGO_API = "https://api.mercadopago.com";
+const WEBHOOK_CLAIM_LEASE_MS = 10 * 60 * 1000;
 
 let config;
 
@@ -118,8 +119,11 @@ function parseProxyValue(value) {
 function sanitizeHeaders(headers) {
   const clone = { ...headers };
 
-  if (clone.authorization) clone.authorization = "[redacted]";
-  if (clone.cookie) clone.cookie = "[redacted]";
+  for (const name of Object.keys(clone)) {
+    if (["authorization", "cookie", "x-signature"].includes(name.toLowerCase())) {
+      clone[name] = "[redacted]";
+    }
+  }
 
   return clone;
 }
@@ -310,27 +314,84 @@ function buildEventContext(req) {
   };
 }
 
-function extractSchoolIdFromExternalReference(externalReference) {
+const MAX_EXTRA_STUDENTS = 10000;
+const BASE_STUDENTS = 50;
+const CURRENT_V2_EXTERNAL_REFERENCE_PATTERN =
+  /^flyboty:v2:(LOW_COST|STANDARD|FULL):(monthly|annual):(0|[1-9][0-9]{0,4}):([1-9][0-9]{0,8}):([a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}):([a-f0-9]{24})$/i;
+const CURRENT_V1_EXTERNAL_REFERENCE_PATTERN =
+  /^flyboty:(LOW_COST|STANDARD|FULL):(monthly|annual):([a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}):([a-f0-9]{24})$/i;
+const LEGACY_EXTERNAL_REFERENCE_PATTERN =
+  /^(LOW_COST|STANDARD|FULL)_([a-f0-9]{24})$/i;
+const LICENSE_STATUSES = new Set([
+  "active",
+  "inactive",
+  "pending",
+  "trialing",
+  "past_due",
+]);
+
+function parseExternalReference(externalReference) {
   if (!externalReference) return null;
 
-  const matches = String(externalReference).match(/[a-f0-9]{24}/gi);
-  if (!matches || matches.length === 0) return null;
+  const ref = String(externalReference).trim();
+  const currentV2 = ref.match(CURRENT_V2_EXTERNAL_REFERENCE_PATTERN);
+  if (currentV2) {
+    const extraStudents = Number(currentV2[3]);
+    const amount = Number(currentV2[4]);
+    if (!Number.isSafeInteger(extraStudents) || extraStudents > MAX_EXTRA_STUDENTS
+      || !Number.isSafeInteger(amount) || amount <= 0) {
+      return null;
+    }
+    return {
+      version: "v2",
+      planId: currentV2[1].toUpperCase(),
+      billingCycle: currentV2[2].toLowerCase(),
+      extraStudents,
+      amount,
+      attemptId: currentV2[5].toLowerCase(),
+      schoolId: currentV2[6].toLowerCase(),
+      legacy: false,
+    };
+  }
 
-  const candidate = matches[matches.length - 1];
-  if (!ObjectId.isValid(candidate)) return null;
+  const currentV1 = ref.match(CURRENT_V1_EXTERNAL_REFERENCE_PATTERN);
+  if (currentV1) {
+    return {
+      version: "v1",
+      planId: currentV1[1].toUpperCase(),
+      billingCycle: currentV1[2].toLowerCase(),
+      extraStudents: null,
+      amount: null,
+      attemptId: currentV1[3].toLowerCase(),
+      schoolId: currentV1[4].toLowerCase(),
+      legacy: false,
+    };
+  }
 
-  return candidate;
+  const legacy = ref.match(LEGACY_EXTERNAL_REFERENCE_PATTERN);
+  if (legacy && ObjectId.isValid(legacy[2])) {
+    return {
+      version: "legacy",
+      planId: legacy[1].toUpperCase(),
+      billingCycle: null,
+      extraStudents: null,
+      amount: null,
+      attemptId: null,
+      schoolId: legacy[2].toLowerCase(),
+      legacy: true,
+    };
+  }
+
+  return null;
+}
+
+function extractSchoolIdFromExternalReference(externalReference) {
+  return parseExternalReference(externalReference)?.schoolId || null;
 }
 
 // Extrae el planId del external_reference con formato "PLAN_ID_<24hexSchoolId>"
 function extractPlanIdFromExternalReference(externalReference) {
-  if (!externalReference) return null;
-  const ref = String(externalReference);
-  const schoolId = extractSchoolIdFromExternalReference(ref);
-  if (!schoolId) return null;
-  // planId es todo lo que está antes de "_<schoolId>"
-  const planId = ref.slice(0, ref.length - schoolId.length - 1);
-  return planId || null;
+  return parseExternalReference(externalReference)?.planId || null;
 }
 
 // Deriva billingCycle del campo reason (ej: "FlyBoty LOW_COST · Anual")
@@ -342,22 +403,329 @@ function extractBillingCycleFromReason(reason) {
   return null;
 }
 
-function mapSubscriptionStatus(status) {
-  switch (status) {
-    case "authorized":
-      return "active";
-    case "paused":
-      return "paused";
-    case "cancelled":
-      return "cancelled";
-    case "pending":
-      return "pending";
-    default:
-      return status || "inactive";
+function extractBillingCycle(externalReference, reason) {
+  const parsed = parseExternalReference(externalReference);
+  if (parsed?.billingCycle) return parsed.billingCycle;
+  return extractBillingCycleFromReason(reason);
+}
+
+function normalizeLicenseStatus(value) {
+  return LICENSE_STATUSES.has(value) ? value : "inactive";
+}
+
+// A preapproval only represents the payer's authorization. It must never
+// activate the product; only a verified payment can grant access.
+function licenseStatusFromPreapproval(currentStatus, preapprovalStatus) {
+  const current = normalizeLicenseStatus(currentStatus);
+  if (preapprovalStatus === "pending" || preapprovalStatus === "authorized") {
+    return current === "active" ? null : "pending";
   }
+  if (preapprovalStatus === "paused"
+    || preapprovalStatus === "canceled"
+    || preapprovalStatus === "cancelled") {
+    return "inactive";
+  }
+  return null;
+}
+
+function licenseStatusFromPayment(currentStatus, paymentStatus) {
+  const current = normalizeLicenseStatus(currentStatus);
+  if (paymentStatus === "approved") return "active";
+  if (paymentStatus === "pending" || paymentStatus === "in_process") {
+    return current === "active" || current === "past_due" ? null : "pending";
+  }
+  if (["cancelled", "canceled", "rejected", "refunded", "charged_back"].includes(paymentStatus)) {
+    return current === "active" ? "past_due" : "inactive";
+  }
+  return null;
+}
+
+function asValidDate(value) {
+  if (!value) return null;
+  const parsed = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function resourceDate(result, fallback = new Date()) {
+  const source = result?.date_last_updated
+    || result?.last_modified
+    || result?.date_approved
+    || result?.date_created;
+  return asValidDate(source) || fallback;
+}
+
+function resourceCreatedAt(result) {
+  return asValidDate(result?.date_created);
+}
+
+function sameExternalReference(left, right) {
+  return Boolean(left) && Boolean(right) && String(left) === String(right);
+}
+
+function providerId(value) {
+  return value === undefined || value === null || value === "" ? null : String(value);
+}
+
+function isV2Reference(parsedReference) {
+  return parsedReference?.version === "v2";
+}
+
+function isPreapprovalLossStatus(status) {
+  return status === "paused" || status === "canceled" || status === "cancelled";
+}
+
+function isPaymentLossStatus(status) {
+  return ["cancelled", "canceled", "rejected", "refunded", "charged_back"].includes(status);
+}
+
+function sameEntitlementIdentity(school, externalReference, preapprovalId) {
+  if (!sameExternalReference(
+    school?.mercadoPagoEntitlementExternalReference,
+    externalReference
+  )) {
+    return false;
+  }
+
+  const currentPreapprovalId = providerId(
+    school?.mercadoPagoEntitlementPreapprovalId
+  );
+  const incomingPreapprovalId = providerId(preapprovalId);
+
+  // Old v2 records may not yet have the binding field. In that case the
+  // unique v2 reference remains the compatibility identity until its next
+  // verified event backfills the preapproval id.
+  return !currentPreapprovalId
+    || !incomingPreapprovalId
+    || currentPreapprovalId === incomingPreapprovalId;
+}
+
+function hasExactLegacyEntitlementBinding(school, preapprovalId) {
+  const incomingPreapprovalId = providerId(preapprovalId);
+  if (!incomingPreapprovalId) return false;
+
+  // `mercadoPagoActiveSubscriptionId` and `mercadoPagoSubscriptionId` are
+  // historical fields. They are accepted only as an exact id match so legacy
+  // references, which were reused per school/plan, can never select a newer
+  // subscription merely by sharing an external_reference.
+  const currentPreapprovalId = providerId(
+    school?.mercadoPagoEntitlementPreapprovalId
+  ) || providerId(school?.mercadoPagoActiveSubscriptionId)
+    || providerId(school?.mercadoPagoSubscriptionId);
+
+  return Boolean(currentPreapprovalId
+    && currentPreapprovalId === incomingPreapprovalId);
+}
+
+function incomingAttemptIsNewer(school, externalReference, preapprovalId, attemptCreatedAt) {
+  const currentReference = school?.mercadoPagoEntitlementExternalReference;
+  if (!currentReference || sameEntitlementIdentity(school, externalReference, preapprovalId)) {
+    return true;
+  }
+
+  const incomingCreatedAt = asValidDate(attemptCreatedAt);
+  if (!incomingCreatedAt) return false;
+
+  const currentCreatedAt = asValidDate(
+    school?.mercadoPagoEntitlementAttemptCreatedAt
+  );
+  // A pre-existing entitlement without the new creation timestamp is a
+  // migration case. Accept a real, dated v2 attempt once, then persist its
+  // identity so all later ordering is deterministic.
+  if (!currentCreatedAt) return true;
+  return incomingCreatedAt.getTime() > currentCreatedAt.getTime();
+}
+
+function entitlementDecision(subscriptionStatus, preapprovalId, attemptCreatedAt) {
+  return {
+    subscriptionStatus,
+    ...(preapprovalId ? { preapprovalId } : {}),
+    ...(attemptCreatedAt ? { attemptCreatedAt } : {}),
+  };
+}
+
+function paymentPreapprovalId(payment) {
+  const value = payment?.preapproval_id || payment?.metadata?.preapproval_id;
+  return value === undefined || value === null || value === "" ? null : String(value);
+}
+
+function amountsMatch(left, right) {
+  const leftAmount = Number(left);
+  const rightAmount = Number(right);
+  return Number.isFinite(leftAmount)
+    && Number.isFinite(rightAmount)
+    && Math.abs(leftAmount - rightAmount) < 0.01;
+}
+
+function isVerifiedSubscriptionPayment(
+  payment,
+  subscription,
+  parsedReference,
+  preapprovalIdOverride = null
+) {
+  const paymentPreapproval = paymentPreapprovalId(payment);
+  const fallbackPreapproval = providerId(preapprovalIdOverride);
+  // When both authenticated Mercado Pago resources identify a subscription,
+  // disagreement is unsafe: keep the payment as audit-only.
+  if (paymentPreapproval && fallbackPreapproval
+    && paymentPreapproval !== fallbackPreapproval) {
+    return false;
+  }
+  const preapprovalId = paymentPreapproval || fallbackPreapproval;
+  if (!preapprovalId || !subscription || String(subscription.id) !== preapprovalId) {
+    return false;
+  }
+
+  const paymentReference = payment?.external_reference;
+  if (!sameExternalReference(paymentReference, subscription?.external_reference)) {
+    return false;
+  }
+
+  if (parsedReference?.amount !== null && parsedReference?.amount !== undefined) {
+    if (String(payment?.currency_id || "").toUpperCase() !== "ARS"
+      || String(subscription?.auto_recurring?.currency_id || "").toUpperCase() !== "ARS"
+      || !amountsMatch(payment?.transaction_amount, parsedReference.amount)
+      || !amountsMatch(subscription?.auto_recurring?.transaction_amount, parsedReference.amount)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function entitlementDecisionFromPreapproval(
+  school,
+  externalReference,
+  preapprovalStatus,
+  eventAt,
+  identity = {}
+) {
+  const entitlementStatus = licenseStatusFromPreapproval(
+    school?.subscriptionStatus,
+    preapprovalStatus
+  );
+  if (!entitlementStatus) return null;
+
+  const parsedReference = identity.parsedReference || parseExternalReference(externalReference);
+  const preapprovalId = providerId(identity.preapprovalId);
+  const attemptCreatedAt = asValidDate(identity.attemptCreatedAt);
+  const currentStatus = normalizeLicenseStatus(school?.subscriptionStatus);
+  const currentReference = school?.mercadoPagoEntitlementExternalReference;
+  const sameReference = sameExternalReference(currentReference, externalReference);
+  const sameEntitlement = sameEntitlementIdentity(
+    school,
+    externalReference,
+    preapprovalId
+  );
+  const currentEntitlementAt = asValidDate(school?.mercadoPagoEntitlementUpdatedAt);
+
+  if (!isV2Reference(parsedReference)) {
+    if (!isPreapprovalLossStatus(preapprovalStatus)
+      || !hasExactLegacyEntitlementBinding(school, preapprovalId)
+      || (currentReference && !sameReference)) {
+      return null;
+    }
+    if (sameReference && currentEntitlementAt
+      && currentEntitlementAt.getTime() > eventAt.getTime()) return null;
+    return entitlementDecision(entitlementStatus, preapprovalId);
+  }
+
+  if (sameReference && !sameEntitlement) return null;
+  if (sameEntitlement && currentEntitlementAt
+    && currentEntitlementAt.getTime() > eventAt.getTime()) return null;
+
+  if (preapprovalStatus === "pending" || preapprovalStatus === "authorized") {
+    if (currentStatus === "active" || currentStatus === "past_due") {
+      return null;
+    }
+    if (!sameEntitlement && (!attemptCreatedAt || !incomingAttemptIsNewer(
+      school,
+      externalReference,
+      preapprovalId,
+      attemptCreatedAt
+    ))) {
+      return null;
+    }
+    return entitlementDecision("pending", preapprovalId, attemptCreatedAt);
+  }
+
+  // A cancellation must never create or take over an entitlement. It may
+  // only revoke the exact v2 attempt currently bound to the school.
+  if (!sameEntitlement) return null;
+  return entitlementDecision("inactive", preapprovalId, attemptCreatedAt);
+}
+
+function entitlementDecisionFromPayment(
+  school,
+  externalReference,
+  paymentStatus,
+  paymentEventAt,
+  verifiedSubscription,
+  identity = {}
+) {
+  const entitlementStatus = licenseStatusFromPayment(
+    school?.subscriptionStatus,
+    paymentStatus
+  );
+  if (!entitlementStatus) return null;
+
+  const parsedReference = identity.parsedReference || parseExternalReference(externalReference);
+  const preapprovalId = providerId(identity.preapprovalId)
+    || providerId(verifiedSubscription?.id);
+  const attemptCreatedAt = asValidDate(identity.attemptCreatedAt)
+    || resourceCreatedAt(verifiedSubscription);
+  const currentReference = school?.mercadoPagoEntitlementExternalReference;
+  const sameReference = sameExternalReference(currentReference, externalReference);
+  const sameEntitlement = sameEntitlementIdentity(
+    school,
+    externalReference,
+    preapprovalId
+  );
+  const currentEntitlementAt = asValidDate(school?.mercadoPagoEntitlementUpdatedAt);
+
+  if (!isV2Reference(parsedReference)) {
+    if (!isPaymentLossStatus(paymentStatus)
+      || !hasExactLegacyEntitlementBinding(school, preapprovalId)
+      || (currentReference && !sameReference)) {
+      return null;
+    }
+    if (sameReference && currentEntitlementAt
+      && currentEntitlementAt.getTime() > paymentEventAt.getTime()) return null;
+    return entitlementDecision(entitlementStatus, preapprovalId);
+  }
+
+  if (sameReference && !sameEntitlement) return null;
+  if (sameEntitlement && currentEntitlementAt
+    && currentEntitlementAt.getTime() > paymentEventAt.getTime()) return null;
+
+  if (sameEntitlement) {
+    return entitlementDecision(entitlementStatus, preapprovalId, attemptCreatedAt);
+  }
+
+  // A different attempt may replace the current entitlement only after a
+  // verified approved charge, and only when the subscription itself was
+  // created later. Provider event timestamps are not a checkout ordering key.
+  if (currentReference && entitlementStatus !== "active") return null;
+  if (!attemptCreatedAt || !incomingAttemptIsNewer(
+    school,
+    externalReference,
+    preapprovalId,
+    attemptCreatedAt
+  )) {
+    return null;
+  }
+
+  return entitlementDecision(entitlementStatus, preapprovalId, attemptCreatedAt);
+}
+
+function maskEmail(value) {
+  const email = typeof value === "string" ? value.trim() : "";
+  const at = email.lastIndexOf("@");
+  if (at <= 0 || at === email.length - 1) return null;
+  return email.slice(0, 1) + "***@" + email.slice(at + 1);
 }
 
 function buildSchoolEventEntry({
+  eventKey,
   sourceType,
   sourceId,
   action,
@@ -368,6 +736,7 @@ function buildSchoolEventEntry({
   rawEventId,
 }) {
   return {
+    eventKey,
     sourceType,
     sourceId: sourceId || null,
     action: action || null,
@@ -388,12 +757,15 @@ async function registerWebhookEvent({
 }) {
   const db = await getMongoDb();
   const collection = db.collection("mercadopago_webhook_events");
+  const eventKey = signatureResult.valid
+    ? context.eventKey
+    : context.eventKey + ":invalid:" + context.requestId;
 
   const result = await collection.updateOne(
-    { eventKey: context.eventKey },
+    { eventKey },
     {
       $setOnInsert: {
-        eventKey: context.eventKey,
+        eventKey,
         payloadType: context.payloadType,
         action: context.action,
         notificationId: context.notificationId,
@@ -427,26 +799,125 @@ async function registerWebhookEvent({
   };
 }
 
+async function claimWebhookEvent({ context, req, signatureResult }) {
+  const db = await getMongoDb();
+  const collection = db.collection("mercadopago_webhook_events");
+  const now = new Date();
+  const claimToken = crypto.randomUUID();
+  const leaseExpiresAt = new Date(now.getTime() + WEBHOOK_CLAIM_LEASE_MS);
+
+  try {
+    await collection.insertOne({
+      eventKey: context.eventKey,
+      payloadType: context.payloadType,
+      action: context.action,
+      notificationId: context.notificationId,
+      resourceId: context.resourceId,
+      version: context.version,
+      signatureValid: signatureResult.valid,
+      signatureReason: signatureResult.reason,
+      headers: sanitizeHeaders(req.headers),
+      body: req.body,
+      query: req.query,
+      requestId: context.requestId,
+      sourceIp: context.sourceIp,
+      receivedAt: context.receivedAt,
+      lastReceivedAt: now,
+      processingState: "processing",
+      processingStartedAt: now,
+      processingClaimToken: claimToken,
+      processingLeaseExpiresAt: leaseExpiresAt,
+      processingAttempts: 1,
+      receiveCount: 1,
+      notes: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+    return { state: "claimed", claimToken };
+  } catch (error) {
+    if (error?.code !== 11000) throw error;
+  }
+
+  // Retry failed processing and recover an abandoned lease, but never run a
+  // successfully completed event twice.
+  const retryBefore = new Date(now.getTime() - WEBHOOK_CLAIM_LEASE_MS);
+  const retry = await collection.updateOne(
+    {
+      eventKey: context.eventKey,
+      $or: [
+        { processingState: "processing_error" },
+        { processingState: "received" },
+        {
+          processingState: "processing",
+          $or: [
+            { processingLeaseExpiresAt: { $lt: now } },
+            {
+              processingLeaseExpiresAt: { $exists: false },
+              processingStartedAt: { $lt: retryBefore },
+            },
+          ],
+        },
+      ],
+    },
+    {
+      $set: {
+        processingState: "processing",
+        processingStartedAt: now,
+        processingClaimToken: claimToken,
+        processingLeaseExpiresAt: leaseExpiresAt,
+        lastReceivedAt: now,
+        notes: null,
+        updatedAt: now,
+      },
+      $inc: {
+        receiveCount: 1,
+        processingAttempts: 1,
+      },
+    }
+  );
+
+  if (retry.matchedCount === 1) {
+    return { state: "claimed", claimToken };
+  }
+
+  const existing = await collection.findOne(
+    { eventKey: context.eventKey },
+    { projection: { processingState: 1 } }
+  );
+  return {
+    state: existing?.processingState === "processed" ? "processed" : "in_progress",
+    claimToken: null,
+  };
+}
+
 async function finalizeWebhookEvent({
   context,
+  claimToken,
   processingState,
   notes,
   resolvedSchoolId,
 }) {
   const db = await getMongoDb();
 
-  await db.collection("mercadopago_webhook_events").updateOne(
-    { eventKey: context.eventKey },
+  const result = await db.collection("mercadopago_webhook_events").updateOne(
+    {
+      eventKey: context.eventKey,
+      processingState: "processing",
+      processingClaimToken: claimToken,
+    },
     {
       $set: {
         processingState,
         notes: notes || null,
         resolvedSchoolId: resolvedSchoolId || null,
         processedAt: new Date(),
+        processingLeaseExpiresAt: null,
         updatedAt: new Date(),
       },
     }
   );
+
+  return result.matchedCount === 1;
 }
 
 async function findSchoolByExternalReference(externalReference) {
@@ -461,6 +932,169 @@ async function findSchoolByExternalReference(externalReference) {
   if (!school) return null;
 
   return { schoolId, school };
+}
+
+function exactFieldCondition(field, value) {
+  return value === undefined
+    ? { [field]: { $exists: false } }
+    : { [field]: value };
+}
+
+async function appendSchoolEventOnce(db, schoolId, entry) {
+  await db.collection("schools").updateOne(
+    {
+      _id: schoolId,
+      "mercadoPagoEventHistory.eventKey": { $ne: entry.eventKey },
+    },
+    {
+      $push: {
+        mercadoPagoEventHistory: {
+          $each: [entry],
+          $slice: -30,
+        },
+      },
+    }
+  );
+}
+
+async function updateCurrentSubscriptionMetadata({
+  db,
+  schoolId,
+  subscriptionId,
+  result,
+  context,
+  externalReference,
+  eventAt,
+  attemptCreatedAt,
+}) {
+  const subscriptionAttemptCreatedAt = asValidDate(attemptCreatedAt)
+    || resourceCreatedAt(result);
+  const nextPaymentDate = asValidDate(result?.next_payment_date);
+  const payerEmailMasked = maskEmail(result?.payer_email);
+  const metadata = {
+    mercadoPagoExternalReference: externalReference,
+    ...(payerEmailMasked ? { mercadoPagoPayerEmailMasked: payerEmailMasked } : {}),
+    mercadoPagoLastWebhookAt: new Date(),
+    mercadoPagoLastEventType: context.payloadType,
+    mercadoPagoLastEventAction: context.action,
+    mercadoPagoSubscriptionId: String(subscriptionId),
+    mercadoPagoSubscriptionExternalReference: externalReference,
+    mercadoPagoSubscriptionStatus: result?.status || null,
+    mercadoPagoSubscriptionReason: result?.reason || null,
+    mercadoPagoSubscriptionVersion: context.version,
+    mercadoPagoSubscriptionLastEventAt: eventAt,
+    ...(subscriptionAttemptCreatedAt
+      ? { mercadoPagoSubscriptionAttemptCreatedAt: subscriptionAttemptCreatedAt }
+      : {}),
+    ...(nextPaymentDate ? { mercadoPagoSubscriptionNextPaymentDate: nextPaymentDate } : {}),
+    updatedAt: new Date(),
+  };
+
+  const sameReferenceAndNotOlder = {
+    $and: [
+      { mercadoPagoSubscriptionExternalReference: externalReference },
+      {
+        $or: [
+          { mercadoPagoSubscriptionLastEventAt: { $exists: false } },
+          { mercadoPagoSubscriptionLastEventAt: null },
+          { mercadoPagoSubscriptionLastEventAt: { $lte: eventAt } },
+        ],
+      },
+    ],
+  };
+  const metadataOrdering = [sameReferenceAndNotOlder];
+  if (subscriptionAttemptCreatedAt) {
+    // `last_modified` orders state changes inside one subscription, but it
+    // cannot order checkout attempts: an old subscription can be cancelled
+    // long after a newer one was created. A different reference therefore
+    // needs a strictly later `date_created`. If the old metadata predates
+    // this field, leave it untouched until a same-reference event backfills
+    // the creation date instead of guessing from a modification timestamp.
+    metadataOrdering.push({
+      $and: [
+        { mercadoPagoSubscriptionExternalReference: { $ne: externalReference } },
+        {
+          $or: [
+            { mercadoPagoSubscriptionExternalReference: { $exists: false } },
+            { mercadoPagoSubscriptionExternalReference: null },
+            {
+              mercadoPagoSubscriptionAttemptCreatedAt: {
+                $type: "date",
+                $lt: subscriptionAttemptCreatedAt,
+              },
+            },
+          ],
+        },
+      ],
+    });
+  }
+
+  return db.collection("schools").updateOne(
+    {
+      _id: schoolId,
+      $or: metadataOrdering,
+    },
+    { $set: metadata }
+  );
+}
+
+async function applySchoolEntitlement({
+  db,
+  schoolId,
+  decide,
+  buildUpdate,
+}) {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const school = await db.collection("schools").findOne({ _id: schoolId });
+    if (!school) return { applied: false, reason: "school_not_found" };
+
+    const decision = decide(school);
+    if (!decision) return { applied: false, reason: "not_current" };
+
+    const result = await db.collection("schools").updateOne(
+      {
+        _id: schoolId,
+        $and: [
+          exactFieldCondition("subscriptionStatus", school.subscriptionStatus),
+          exactFieldCondition(
+            "mercadoPagoEntitlementExternalReference",
+            school.mercadoPagoEntitlementExternalReference
+          ),
+          exactFieldCondition(
+            "mercadoPagoEntitlementUpdatedAt",
+            school.mercadoPagoEntitlementUpdatedAt
+          ),
+          exactFieldCondition(
+            "mercadoPagoEntitlementPreapprovalId",
+            school.mercadoPagoEntitlementPreapprovalId
+          ),
+          exactFieldCondition(
+            "mercadoPagoEntitlementAttemptCreatedAt",
+            school.mercadoPagoEntitlementAttemptCreatedAt
+          ),
+          exactFieldCondition(
+            "mercadoPagoSubscriptionExternalReference",
+            school.mercadoPagoSubscriptionExternalReference
+          ),
+          exactFieldCondition(
+            "mercadoPagoSubscriptionLastEventAt",
+            school.mercadoPagoSubscriptionLastEventAt
+          ),
+          exactFieldCondition(
+            "mercadoPagoSubscriptionAttemptCreatedAt",
+            school.mercadoPagoSubscriptionAttemptCreatedAt
+          ),
+        ],
+      },
+      { $set: buildUpdate(school, decision) }
+    );
+
+    if (result.matchedCount === 1) {
+      return { applied: true, decision };
+    }
+  }
+
+  throw new Error("No se pudo aplicar el estado de licencia de forma consistente");
 }
 
 async function updateSchoolFromSubscription({
@@ -478,60 +1112,70 @@ async function updateSchoolFromSubscription({
     return null;
   }
 
-  const eventDate = result?.last_modified || result?.date_created || new Date();
-  const receivedAt = new Date();
+  const eventDate = resourceDate(result);
+  const parsedReference = parseExternalReference(externalReference);
+  const attemptCreatedAt = resourceCreatedAt(result);
   const db = await getMongoDb();
 
-  const parsedPlanId = extractPlanIdFromExternalReference(externalReference);
-  const parsedBillingCycle = extractBillingCycleFromReason(result?.reason);
-  const nextPaymentDate = result?.next_payment_date
-    ? new Date(result.next_payment_date)
-    : result?.auto_recurring?.end_date
-    ? new Date(result.auto_recurring.end_date)
-    : null;
+  // Legacy and v1 references are deliberately audit-only unless an exact
+  // preapproval binding authorizes a loss transition below. Do not let their
+  // shared/stale references overwrite the current subscription metadata.
+  if (isV2Reference(parsedReference)) {
+    await updateCurrentSubscriptionMetadata({
+      db,
+      schoolId: resolved.school._id,
+      subscriptionId,
+      result,
+      context,
+      externalReference,
+      eventAt: eventDate,
+      attemptCreatedAt,
+    });
+  }
 
-  const planFields = {};
-  if (parsedPlanId) planFields.planName = parsedPlanId;
-  if (parsedBillingCycle) planFields.billingCycle = parsedBillingCycle;
-  if (nextPaymentDate) planFields.subscriptionNextPaymentDate = nextPaymentDate;
+  await applySchoolEntitlement({
+    db,
+    schoolId: resolved.school._id,
+    decide: (school) => entitlementDecisionFromPreapproval(
+      school,
+      externalReference,
+      result?.status,
+      eventDate,
+      {
+        parsedReference,
+        preapprovalId: subscriptionId,
+        attemptCreatedAt,
+      }
+    ),
+    buildUpdate: (_school, decision) => ({
+      subscriptionStatus: decision.subscriptionStatus,
+      mercadoPagoEntitlementUpdatedAt: eventDate,
+      mercadoPagoEntitlementExternalReference: externalReference,
+      ...(decision.preapprovalId
+        ? { mercadoPagoEntitlementPreapprovalId: decision.preapprovalId }
+        : {}),
+      ...(decision.attemptCreatedAt
+        ? { mercadoPagoEntitlementAttemptCreatedAt: decision.attemptCreatedAt }
+        : {}),
+      mercadoPagoEntitlementSource: "subscription_preapproval",
+      mercadoPagoEntitlementPreapprovalStatus: result?.status || null,
+      updatedAt: new Date(),
+    }),
+  });
 
-  await db.collection("schools").updateOne(
-    { _id: resolved.school._id },
-    {
-      $set: {
-        mercadoPagoExternalReference: externalReference,
-        mercadoPagoSchoolId: resolved.schoolId,
-        mercadoPagoPayerEmail:
-          result?.payer_email || resolved.school?.mercadoPagoPayerEmail || null,
-        mercadoPagoLastWebhookAt: receivedAt,
-        mercadoPagoLastEventType: context.payloadType,
-        mercadoPagoLastEventAction: context.action,
-        mercadoPagoSubscriptionId: subscriptionId,
-        mercadoPagoSubscriptionStatus: result?.status || null,
-        mercadoPagoSubscriptionReason: result?.reason || null,
-        mercadoPagoSubscriptionVersion: context.version,
-        mercadoPagoSubscriptionLastEventAt: new Date(eventDate),
-        subscriptionStatus: mapSubscriptionStatus(result?.status),
-        ...planFields,
-        updatedAt: new Date(),
-      },
-      $push: {
-        mercadoPagoEventHistory: {
-          $each: [
-            buildSchoolEventEntry({
-              sourceType: context.payloadType,
-              sourceId: subscriptionId,
-              action: context.action,
-              status: result?.status,
-              externalReference,
-              receivedAt,
-              rawEventId: context.notificationId,
-            }),
-          ],
-          $slice: -30,
-        },
-      },
-    }
+  await appendSchoolEventOnce(
+    db,
+    resolved.school._id,
+    buildSchoolEventEntry({
+      eventKey: context.eventKey,
+      sourceType: context.payloadType,
+      sourceId: subscriptionId,
+      action: context.action,
+      status: result?.status,
+      externalReference,
+      receivedAt: eventDate,
+      rawEventId: context.notificationId,
+    })
   );
 
   return resolved.schoolId;
@@ -541,6 +1185,8 @@ async function updateSchoolFromPayment({
   paymentId,
   result,
   context,
+  verifiedSubscription,
+  preapprovalIdOverride = null,
 }) {
   const externalReference = result?.external_reference || null;
   const resolved = await findSchoolByExternalReference(externalReference);
@@ -553,20 +1199,29 @@ async function updateSchoolFromPayment({
   }
 
   const receivedAt = new Date();
-  const isApproved = result?.status === "approved";
-  const approvedDate = result?.date_approved
-    ? new Date(result.date_approved)
-    : receivedAt;
+  const parsedReference = parseExternalReference(externalReference);
+  const paymentPreapproval = paymentPreapprovalId(result);
+  const fallbackPreapproval = providerId(preapprovalIdOverride);
+  const preapprovalId = paymentPreapproval || fallbackPreapproval;
+  const isVerified = isVerifiedSubscriptionPayment(
+    result,
+    verifiedSubscription,
+    parsedReference,
+    fallbackPreapproval
+  );
+  const approvedDate = asValidDate(result?.date_approved) || receivedAt;
+  const paymentEventAt = resourceDate(result, receivedAt);
+  const parsedPlanId = parsedReference?.planId || null;
+  const parsedBillingCycle = parsedReference?.billingCycle
+    || extractBillingCycle(externalReference, result?.description || result?.reason);
 
   const update = {
-    mercadoPagoExternalReference: externalReference,
     mercadoPagoSchoolId: resolved.schoolId,
-    mercadoPagoPayerEmail:
-      result?.payer?.email || resolved.school?.mercadoPagoPayerEmail || null,
     mercadoPagoLastWebhookAt: receivedAt,
     mercadoPagoLastEventType: context.payloadType,
     mercadoPagoLastEventAction: context.action,
     mercadoPagoLastPaymentId: String(paymentId),
+    mercadoPagoLastPaymentExternalReference: externalReference,
     mercadoPagoLastPaymentStatus: result?.status || null,
     mercadoPagoLastPaymentStatusDetail: result?.status_detail || null,
     mercadoPagoLastPaymentAmount: result?.transaction_amount ?? null,
@@ -580,33 +1235,86 @@ async function updateSchoolFromPayment({
     updatedAt: new Date(),
   };
 
-  if (isApproved) {
-    update.LastAprovedPaymentDate = approvedDate;
-    update.LastAprovedAmount = result?.transaction_amount ?? null;
+  const db = await getMongoDb();
+
+  await db.collection("schools").updateOne(
+    { _id: resolved.school._id },
+    { $set: update }
+  );
+
+  if (!isVerified) {
+    console.warn("[payment] Pago sin preaprobacion verificada; solo se guarda auditoria:", paymentId);
+  } else {
+    const nextPaymentDate = asValidDate(verifiedSubscription?.next_payment_date);
+    const entitlement = await applySchoolEntitlement({
+      db,
+      schoolId: resolved.school._id,
+      decide: (school) => entitlementDecisionFromPayment(
+        school,
+        externalReference,
+        result?.status,
+        paymentEventAt,
+        verifiedSubscription,
+        {
+          parsedReference,
+          preapprovalId,
+          attemptCreatedAt: resourceCreatedAt(verifiedSubscription),
+        }
+      ),
+      buildUpdate: (_school, decision) => {
+        const entitlementUpdate = {
+          subscriptionStatus: decision.subscriptionStatus,
+          mercadoPagoEntitlementUpdatedAt: paymentEventAt,
+          mercadoPagoEntitlementExternalReference: externalReference,
+          ...(decision.preapprovalId
+            ? { mercadoPagoEntitlementPreapprovalId: decision.preapprovalId }
+            : {}),
+          ...(decision.attemptCreatedAt
+            ? { mercadoPagoEntitlementAttemptCreatedAt: decision.attemptCreatedAt }
+            : {}),
+          mercadoPagoEntitlementPaymentId: String(paymentId),
+          mercadoPagoEntitlementPaymentStatus: result?.status || null,
+          mercadoPagoEntitlementSource: "payment",
+          updatedAt: new Date(),
+        };
+
+        if (result?.status === "approved" && isV2Reference(parsedReference)) {
+          if (parsedPlanId) entitlementUpdate.planName = parsedPlanId;
+          if (parsedBillingCycle) entitlementUpdate.billingCycle = parsedBillingCycle;
+          if (parsedReference?.extraStudents !== null
+            && parsedReference?.extraStudents !== undefined) {
+            entitlementUpdate.extraStudents = parsedReference.extraStudents;
+            entitlementUpdate.maxStudents = BASE_STUDENTS + parsedReference.extraStudents;
+          }
+          if (preapprovalId) entitlementUpdate.mercadoPagoActiveSubscriptionId = preapprovalId;
+          if (nextPaymentDate) entitlementUpdate.subscriptionNextPaymentDate = nextPaymentDate;
+          entitlementUpdate.LastAprovedPaymentDate = approvedDate;
+          entitlementUpdate.LastAprovedAmount = result?.transaction_amount ?? null;
+        }
+
+        return entitlementUpdate;
+      },
+    });
+
+    if (!entitlement.applied) {
+      console.log("[payment] Estado de licencia ignorado por evento no vigente:", paymentId);
+    }
   }
 
-  await (await getMongoDb()).collection("schools").updateOne(
-    { _id: resolved.school._id },
-    {
-      $set: update,
-      $push: {
-        mercadoPagoEventHistory: {
-          $each: [
-            buildSchoolEventEntry({
-              sourceType: context.payloadType,
-              sourceId: String(paymentId),
-              action: context.action,
-              status: result?.status,
-              amount: result?.transaction_amount,
-              externalReference,
-              receivedAt,
-              rawEventId: context.notificationId,
-            }),
-          ],
-          $slice: -30,
-        },
-      },
-    }
+  await appendSchoolEventOnce(
+    db,
+    resolved.school._id,
+    buildSchoolEventEntry({
+      eventKey: context.eventKey,
+      sourceType: context.payloadType,
+      sourceId: String(paymentId),
+      action: context.action,
+      status: result?.status,
+      amount: result?.transaction_amount,
+      externalReference,
+      receivedAt: paymentEventAt,
+      rawEventId: context.notificationId,
+    })
   );
 
   return resolved.schoolId;
@@ -616,6 +1324,7 @@ async function updateSchoolFromAuthorizedPayment({
   authorizedPaymentId,
   result,
   context,
+  appendHistory = true,
 }) {
   const externalReference =
     result?.external_reference ||
@@ -631,13 +1340,12 @@ async function updateSchoolFromAuthorizedPayment({
   }
 
   const receivedAt = new Date();
+  const db = await getMongoDb();
 
-  await (await getMongoDb()).collection("schools").updateOne(
+  await db.collection("schools").updateOne(
     { _id: resolved.school._id },
     {
       $set: {
-        mercadoPagoExternalReference:
-          externalReference || resolved.school?.mercadoPagoExternalReference || null,
         mercadoPagoSchoolId: resolved.schoolId,
         mercadoPagoLastWebhookAt: receivedAt,
         mercadoPagoLastEventType: context.payloadType,
@@ -650,29 +1358,30 @@ async function updateSchoolFromAuthorizedPayment({
           : receivedAt,
         updatedAt: new Date(),
       },
-      $push: {
-        mercadoPagoEventHistory: {
-          $each: [
-            buildSchoolEventEntry({
-              sourceType: context.payloadType,
-              sourceId: String(authorizedPaymentId),
-              action: context.action,
-              status: result?.status || result?.status_detail || "received",
-              externalReference,
-              receivedAt,
-              rawEventId: context.notificationId,
-            }),
-          ],
-          $slice: -30,
-        },
-      },
     }
   );
+
+  if (appendHistory) {
+    await appendSchoolEventOnce(
+      db,
+      resolved.school._id,
+      buildSchoolEventEntry({
+        eventKey: context.eventKey,
+        sourceType: context.payloadType,
+        sourceId: String(authorizedPaymentId),
+        action: context.action,
+        status: result?.status || result?.status_detail || "received",
+        externalReference,
+        receivedAt,
+        rawEventId: context.notificationId,
+      })
+    );
+  }
 
   return resolved.schoolId;
 }
 
-async function handlePaymentEvent(id, context) {
+async function handlePaymentEvent(id, context, preapprovalIdOverride = null) {
   const result = await mercadoPagoGet(`/v1/payments/${id}`);
   const {
     status,
@@ -686,7 +1395,7 @@ async function handlePaymentEvent(id, context) {
   console.log("[payment] Estado:", status, "-", statusDetail);
   console.log("[payment] Referencia:", externalReference);
   console.log("[payment] Monto:", transactionAmount);
-  console.log("[payment] Pagador:", payer?.email);
+  console.log("[payment] Pagador:", maskEmail(payer?.email));
 
   if (status === "approved") {
     console.log(`[payment] APROBADO - ref: ${externalReference}`);
@@ -694,13 +1403,31 @@ async function handlePaymentEvent(id, context) {
     console.log(`[payment] RECHAZADO (${statusDetail}) - ref: ${externalReference}`);
   } else if (status === "pending") {
     console.log(`[payment] PENDIENTE - ref: ${externalReference}`);
-  } else if (status === "cancelled") {
+  } else if (status === "canceled" || status === "cancelled") {
     console.log(`[payment] CANCELADO - ref: ${externalReference}`);
   } else {
     console.log(`[payment] Estado desconocido: ${status}`);
   }
 
-  return updateSchoolFromPayment({ paymentId: id, result, context });
+  let verifiedSubscription = null;
+  // /v1/payments does not always echo the preapproval id. The authorized
+  // payment invoice is an authenticated Mercado Pago resource and supplies
+  // it as a safe fallback when this handler was reached through that topic.
+  const preapprovalId = paymentPreapprovalId(result)
+    || (preapprovalIdOverride ? String(preapprovalIdOverride) : null);
+  if (preapprovalId) {
+    verifiedSubscription = await mercadoPagoGet(
+      "/preapproval/" + encodeURIComponent(preapprovalId)
+    );
+  }
+
+  return updateSchoolFromPayment({
+    paymentId: id,
+    result,
+    context,
+    verifiedSubscription,
+    preapprovalIdOverride,
+  });
 }
 
 async function handleSubscriptionEvent(id, context) {
@@ -715,14 +1442,14 @@ async function handleSubscriptionEvent(id, context) {
   console.log("[suscripcion] ID:", id);
   console.log("[suscripcion] Estado:", status);
   console.log("[suscripcion] Descripcion:", reason);
-  console.log("[suscripcion] Pagador:", payerEmail);
+  console.log("[suscripcion] Pagador:", maskEmail(payerEmail));
   console.log("[suscripcion] Referencia:", externalReference);
 
   if (status === "authorized") {
     console.log(`[suscripcion] AUTORIZADA - ref: ${externalReference}`);
   } else if (status === "paused") {
     console.log(`[suscripcion] PAUSADA - ref: ${externalReference}`);
-  } else if (status === "cancelled") {
+  } else if (status === "canceled" || status === "cancelled") {
     console.log(`[suscripcion] CANCELADA - ref: ${externalReference}`);
   } else {
     console.log(`[suscripcion] Estado desconocido: ${status}`);
@@ -744,11 +1471,27 @@ async function handleAuthorizedPaymentEvent(id, context) {
     result?.external_reference || result?.metadata?.external_reference || null
   );
 
-  return updateSchoolFromAuthorizedPayment({
+  const nestedPaymentId = result?.payment?.id;
+  const authorizedPreapprovalId = result?.preapproval_id
+    ? String(result.preapproval_id)
+    : null;
+  const authorizedSchoolId = await updateSchoolFromAuthorizedPayment({
     authorizedPaymentId: id,
     result,
     context,
+    appendHistory: !nestedPaymentId,
   });
+
+  if (nestedPaymentId) {
+    const paymentSchoolId = await handlePaymentEvent(
+      String(nestedPaymentId),
+      context,
+      authorizedPreapprovalId
+    );
+    return paymentSchoolId || authorizedSchoolId;
+  }
+
+  return authorizedSchoolId;
 }
 
 async function processWebhook(req) {
@@ -803,19 +1546,26 @@ async function processWebhook(req) {
     return;
   }
 
+  let claimToken = null;
+  let ownsClaim = false;
+
   try {
-    const registration = await registerWebhookEvent({
+    const registration = await claimWebhookEvent({
       context,
       req,
       signatureResult,
-      processingState: "received",
-      notes: null,
     });
 
-    if (!registration.inserted) {
+    if (registration.state === "processed") {
       console.log(`[webhook] Evento duplicado ignorado: ${context.eventKey}`);
       return;
     }
+
+    if (registration.state !== "claimed") {
+      throw new Error("El webhook ya esta siendo procesado");
+    }
+    claimToken = registration.claimToken;
+    ownsClaim = true;
 
     let resolvedSchoolId = null;
 
@@ -832,8 +1582,9 @@ async function processWebhook(req) {
       console.log(`[webhook] Tipo de evento no manejado: ${context.payloadType}`);
     }
 
-    await finalizeWebhookEvent({
+    const finalized = await finalizeWebhookEvent({
       context,
+      claimToken,
       processingState: "processed",
       resolvedSchoolId,
       notes:
@@ -843,18 +1594,25 @@ async function processWebhook(req) {
           ? null
           : "Tipo de evento no manejado",
     });
+    if (!finalized) {
+      throw new Error("Se perdio la reclamacion del webhook antes de finalizarlo");
+    }
   } catch (err) {
     console.error("[webhook] Error procesando evento:", err.message);
 
-    try {
-      await finalizeWebhookEvent({
-        context,
-        processingState: "processing_error",
-        notes: err.message,
-      });
-    } catch (auditErr) {
-      console.error("[webhook] Error guardando auditoria:", auditErr.message);
+    if (ownsClaim) {
+      try {
+        await finalizeWebhookEvent({
+          context,
+          claimToken,
+          processingState: "processing_error",
+          notes: err.message,
+        });
+      } catch (auditErr) {
+        console.error("[webhook] Error guardando auditoria:", auditErr.message);
+      }
     }
+    throw err;
   }
 }
 
@@ -929,8 +1687,18 @@ async function workerRequest(request) {
   };
 }
 
+export {
+  entitlementDecisionFromPayment,
+  entitlementDecisionFromPreapproval,
+  extractBillingCycle,
+  isVerifiedSubscriptionPayment,
+  licenseStatusFromPayment,
+  licenseStatusFromPreapproval,
+  parseExternalReference,
+};
+
 export default {
-  async fetch(request, env, ctx) {
+  async fetch(request, env) {
     try {
       initialize(env);
     } catch (error) {
@@ -943,10 +1711,13 @@ export default {
     if (request.method === "POST" && url.pathname === "/webhook/mercadopago") {
       const parsed = await workerRequest(request);
       if (parsed.error) return parsed.error;
-      // Mercado Pago only needs an acknowledgement. Keep the database/API work
-      // alive after responding, so retries are not caused by normal processing time.
-      ctx.waitUntil(processWebhook(parsed.req));
-      return workerJson({ received: true });
+      try {
+        await processWebhook(parsed.req);
+        return workerJson({ received: true });
+      } catch (error) {
+        console.error("[webhook] Procesamiento no confirmado:", error.message);
+        return workerJson({ error: "No se pudo confirmar el procesamiento del webhook" }, 500);
+      }
     }
 
     if (request.method === "GET" && url.pathname === "/health") {
