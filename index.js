@@ -389,6 +389,35 @@ function extractSchoolIdFromExternalReference(externalReference) {
   return parseExternalReference(externalReference)?.schoolId || null;
 }
 
+const CHECKOUT_EXTERNAL_REFERENCE_PATTERN =
+  /^(LOW_COST|STANDARD|FULL)_(MONTHLY|ANNUAL)_(0|[1-9][0-9]{0,4})_([a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12})_([a-f0-9]{24})$/i;
+
+function extractCheckoutDetails(externalReference, reason) {
+  const parsed = parseExternalReference(externalReference);
+  if (parsed) {
+    return {
+      schoolId: parsed.schoolId,
+      planId: parsed.planId,
+      billingCycle: parsed.billingCycle || extractBillingCycleFromReason(reason),
+      extraStudents: parsed.extraStudents ?? 0,
+      attemptId: parsed.attemptId || null,
+    };
+  }
+
+  // Compatibilidad de lectura con la referencia usada por la implementacion
+  // paralela de checkout. No se usa para conceder acceso: la ruta autoritativa
+  // continua exigiendo parseExternalReference y sus verificaciones v2.
+  const checkout = String(externalReference || "").trim().match(CHECKOUT_EXTERNAL_REFERENCE_PATTERN);
+  if (!checkout) return {};
+  return {
+    schoolId: checkout[5].toLowerCase(),
+    planId: checkout[1].toUpperCase(),
+    billingCycle: checkout[2].toLowerCase(),
+    extraStudents: Number(checkout[3]),
+    attemptId: checkout[4].toLowerCase(),
+  };
+}
+
 // Extrae el planId del external_reference con formato "PLAN_ID_<24hexSchoolId>"
 function extractPlanIdFromExternalReference(externalReference) {
   return parseExternalReference(externalReference)?.planId || null;
@@ -407,6 +436,13 @@ function extractBillingCycle(externalReference, reason) {
   const parsed = parseExternalReference(externalReference);
   if (parsed?.billingCycle) return parsed.billingCycle;
   return extractBillingCycleFromReason(reason);
+}
+
+function mapSubscriptionStatus(status) {
+  if (status === "authorized") return "pending";
+  if (status === "canceled" || status === "cancelled") return "cancelled";
+  if (status === "paused" || status === "pending") return status;
+  return status || "inactive";
 }
 
 function normalizeLicenseStatus(value) {
@@ -722,6 +758,164 @@ function maskEmail(value) {
   const at = email.lastIndexOf("@");
   if (at <= 0 || at === email.length - 1) return null;
   return email.slice(0, 1) + "***@" + email.slice(at + 1);
+}
+
+function validDate(value) {
+  return asValidDate(value);
+}
+
+function addCalendarMonths(value, months) {
+  const date = validDate(value);
+  if (!date) return null;
+  const result = new Date(date);
+  const originalDay = result.getUTCDate();
+  result.setUTCDate(1);
+  result.setUTCMonth(result.getUTCMonth() + months);
+  const lastDay = new Date(
+    Date.UTC(result.getUTCFullYear(), result.getUTCMonth() + 1, 0)
+  ).getUTCDate();
+  result.setUTCDate(Math.min(originalDay, lastDay));
+  return result;
+}
+
+function paidPeriodEnd(school) {
+  const canonical = validDate(school?.subscriptionCurrentPeriodEnd);
+  const paymentId = school?.subscriptionLastSuccessfulPaymentId;
+  const paidPreapprovalId = school?.subscriptionLastSuccessfulPaymentPreapprovalId;
+  const currentPreapprovalId = school?.mercadoPagoSubscriptionId;
+  if (!canonical || !paymentId || !paidPreapprovalId || !currentPreapprovalId) {
+    return null;
+  }
+  return String(paidPreapprovalId) === String(currentPreapprovalId)
+    ? canonical
+    : null;
+}
+
+function hasPaidAccess(school, now = new Date()) {
+  const end = paidPeriodEnd(school);
+  return Boolean(end && end.getTime() > now.getTime());
+}
+
+function periodEndFromSubscription(preapproval, periodStart, billingCycle) {
+  const start = validDate(periodStart);
+  const frequency = Number(preapproval?.auto_recurring?.frequency);
+  if (
+    start &&
+    preapproval?.auto_recurring?.frequency_type === "months" &&
+    Number.isInteger(frequency) &&
+    frequency > 0
+  ) {
+    return addCalendarMonths(start, frequency);
+  }
+  return addCalendarMonths(start, billingCycle === "annual" ? 12 : 1);
+}
+
+const ENTITLEMENT_REVOKING_PAYMENT_STATUSES = new Set([
+  "refunded",
+  "charged_back",
+  "cancelled",
+  "canceled",
+]);
+
+function entitlementRevocationFields(
+  school,
+  { paymentId, preapprovalId, externalReference, status, eventAt } = {}
+) {
+  const normalizedStatus = status === "canceled" ? "cancelled" : status || null;
+  if (!paymentId || !ENTITLEMENT_REVOKING_PAYMENT_STATUSES.has(normalizedStatus)) {
+    return null;
+  }
+
+  const grantedPaymentId = school?.subscriptionLastSuccessfulPaymentId;
+  const grantedPreapprovalId = school?.subscriptionLastSuccessfulPaymentPreapprovalId;
+  const currentPreapprovalId = school?.mercadoPagoSubscriptionId;
+  if (
+    !grantedPaymentId ||
+    String(grantedPaymentId) !== String(paymentId) ||
+    !grantedPreapprovalId ||
+    !currentPreapprovalId ||
+    String(grantedPreapprovalId) !== String(currentPreapprovalId) ||
+    (preapprovalId && String(preapprovalId) !== String(grantedPreapprovalId)) ||
+    (externalReference &&
+      school?.mercadoPagoExternalReference &&
+      String(externalReference) !== String(school.mercadoPagoExternalReference))
+  ) {
+    return null;
+  }
+
+  const revokedAt = validDate(eventAt) || new Date();
+  return {
+    subscriptionEntitlementManaged: true,
+    subscriptionStatus: "cancelled",
+    subscriptionCurrentPeriodEnd: revokedAt,
+    subscriptionNextPaymentDate: null,
+    subscriptionCancelAtPeriodEnd: false,
+    subscriptionEntitlementRevokedAt: revokedAt,
+    subscriptionEntitlementRevocationStatus: normalizedStatus,
+    subscriptionEntitlementRevokedPaymentId: String(paymentId),
+    subscriptionEntitlementRevokedPreapprovalId: String(grantedPreapprovalId),
+  };
+}
+
+function pauseTransitionFields(
+  school,
+  providerStatus,
+  { paidAccess = false, eventDate, receivedAt } = {}
+) {
+  const normalizedStatus = providerStatus === "canceled" ? "cancelled" : providerStatus;
+  const providerModifiedAt = validDate(eventDate) || new Date();
+  const observedAt = validDate(receivedAt) || providerModifiedAt;
+  const currentProviderAt = validDate(school?.mercadoPagoSubscriptionProviderModifiedAt);
+  const wasPaused = Boolean(
+    school?.subscriptionPaused === true ||
+      school?.mercadoPagoSubscriptionStatus === "paused"
+  );
+  const isStrictlyNewer = Boolean(
+    !currentProviderAt || providerModifiedAt.getTime() > currentProviderAt.getTime()
+  );
+  const legacyPauseCancellation = Boolean(
+    wasPaused &&
+      school?.subscriptionCancelAtPeriodEnd === true &&
+      school?.mercadoPagoSubscriptionStatus === "paused"
+  );
+
+  if (normalizedStatus === "paused") {
+    return {
+      subscriptionStatus: paidAccess ? "active" : "paused",
+      subscriptionPaused: true,
+      subscriptionPausedAt: validDate(school?.subscriptionPausedAt) || observedAt,
+      subscriptionRenews: false,
+      subscriptionNextPaymentDate: null,
+      ...(legacyPauseCancellation
+        ? {
+            subscriptionCancelAtPeriodEnd: false,
+            subscriptionCancellationRequestedAt: null,
+          }
+        : {}),
+    };
+  }
+
+  if (normalizedStatus === "authorized") {
+    if (wasPaused && !isStrictlyNewer) return null;
+    const renews =
+      paidAccess &&
+      !(school?.subscriptionCancelAtPeriodEnd && !legacyPauseCancellation);
+    return {
+      subscriptionStatus: paidAccess ? "active" : "pending",
+      subscriptionPaused: false,
+      subscriptionPausedAt: null,
+      subscriptionRenews: renews,
+      subscriptionNextPaymentDate: renews ? paidPeriodEnd(school) : null,
+      ...(legacyPauseCancellation
+        ? {
+            subscriptionCancelAtPeriodEnd: false,
+            subscriptionCancellationRequestedAt: null,
+          }
+        : {}),
+    };
+  }
+
+  return {};
 }
 
 function buildSchoolEventEntry({
@@ -1136,31 +1330,119 @@ async function updateSchoolFromSubscription({
   await applySchoolEntitlement({
     db,
     schoolId: resolved.school._id,
-    decide: (school) => entitlementDecisionFromPreapproval(
-      school,
-      externalReference,
-      result?.status,
-      eventDate,
-      {
-        parsedReference,
-        preapprovalId: subscriptionId,
-        attemptCreatedAt,
+    decide: (school) => {
+      const decision = entitlementDecisionFromPreapproval(
+        school,
+        externalReference,
+        result?.status,
+        eventDate,
+        {
+          parsedReference,
+          preapprovalId: subscriptionId,
+          attemptCreatedAt,
+        }
+      );
+      if (decision) return decision;
+
+      // An active paid period survives a provider pause/cancellation until
+      // its paid boundary. Allow those lifecycle-only updates solely for the
+      // exact current preapproval and never for an older provider snapshot.
+      const currentPreapprovalId = providerId(
+        school?.mercadoPagoEntitlementPreapprovalId ||
+          school?.mercadoPagoSubscriptionId
+      );
+      const currentProviderAt = validDate(
+        school?.mercadoPagoSubscriptionProviderModifiedAt ||
+          school?.mercadoPagoEntitlementUpdatedAt
+      );
+      const normalizedProviderStatus = mapSubscriptionStatus(result?.status);
+      if (
+        currentPreapprovalId === String(subscriptionId) &&
+        hasPaidAccess(school, eventDate) &&
+        ["authorized", "paused", "cancelled"].includes(normalizedProviderStatus) &&
+        (!currentProviderAt || currentProviderAt.getTime() <= eventDate.getTime())
+      ) {
+        return {
+          subscriptionStatus: school.subscriptionStatus,
+          preapprovalId: currentPreapprovalId,
+          attemptCreatedAt,
+          lifecycleOnly: true,
+        };
       }
-    ),
-    buildUpdate: (_school, decision) => ({
-      subscriptionStatus: decision.subscriptionStatus,
-      mercadoPagoEntitlementUpdatedAt: eventDate,
-      mercadoPagoEntitlementExternalReference: externalReference,
-      ...(decision.preapprovalId
-        ? { mercadoPagoEntitlementPreapprovalId: decision.preapprovalId }
-        : {}),
-      ...(decision.attemptCreatedAt
-        ? { mercadoPagoEntitlementAttemptCreatedAt: decision.attemptCreatedAt }
-        : {}),
-      mercadoPagoEntitlementSource: "subscription_preapproval",
-      mercadoPagoEntitlementPreapprovalStatus: result?.status || null,
-      updatedAt: new Date(),
-    }),
+      return null;
+    },
+    buildUpdate: (school, decision) => {
+      const receivedAt = new Date();
+      const providerStatus = result?.status === "canceled"
+        ? "cancelled"
+        : result?.status || null;
+      const paidAccess = hasPaidAccess(school, receivedAt);
+      const exactCurrent = String(
+        school?.mercadoPagoEntitlementPreapprovalId ||
+          school?.mercadoPagoSubscriptionId ||
+          ""
+      ) === String(subscriptionId);
+      const lifecycle = {};
+      let subscriptionStatus = decision.subscriptionStatus;
+
+      if (providerStatus === "paused") {
+        Object.assign(lifecycle, pauseTransitionFields(school, providerStatus, {
+          paidAccess,
+          eventDate,
+          receivedAt,
+        }) || {});
+        subscriptionStatus = lifecycle.subscriptionStatus || subscriptionStatus;
+      } else if (providerStatus === "cancelled") {
+        if (paidAccess && exactCurrent) {
+          subscriptionStatus = "active";
+          Object.assign(lifecycle, {
+            subscriptionRenews: false,
+            subscriptionCancelAtPeriodEnd: true,
+            subscriptionCancellationRequestedAt:
+              school?.subscriptionCancellationRequestedAt || receivedAt,
+            subscriptionNextPaymentDate: null,
+          });
+        } else {
+          subscriptionStatus = "inactive";
+          Object.assign(lifecycle, {
+            subscriptionRenews: false,
+            subscriptionCancelAtPeriodEnd: false,
+            subscriptionCancelledAt: receivedAt,
+            subscriptionNextPaymentDate: null,
+          });
+        }
+      } else if (providerStatus === "authorized") {
+        Object.assign(lifecycle, pauseTransitionFields(school, providerStatus, {
+          paidAccess,
+          eventDate,
+          receivedAt,
+        }) || {});
+        subscriptionStatus = lifecycle.subscriptionStatus || subscriptionStatus;
+      } else if (providerStatus === "pending" && !paidAccess) {
+        Object.assign(lifecycle, {
+          subscriptionRenews: false,
+          subscriptionCancelAtPeriodEnd: false,
+        });
+      }
+
+      return {
+        subscriptionEntitlementManaged: true,
+        subscriptionStatus,
+        mercadoPagoEntitlementUpdatedAt: eventDate,
+        mercadoPagoEntitlementExternalReference: externalReference,
+        ...(decision.preapprovalId
+          ? { mercadoPagoEntitlementPreapprovalId: decision.preapprovalId }
+          : {}),
+        ...(decision.attemptCreatedAt
+          ? { mercadoPagoEntitlementAttemptCreatedAt: decision.attemptCreatedAt }
+          : {}),
+        mercadoPagoEntitlementSource: "subscription_preapproval",
+        mercadoPagoEntitlementPreapprovalStatus: result?.status || null,
+        mercadoPagoSubscriptionProviderModifiedAt: eventDate,
+        ...lifecycle,
+        updatedAt: receivedAt,
+      };
+    },
   });
 
   await appendSchoolEventOnce(
@@ -1245,7 +1527,14 @@ async function updateSchoolFromPayment({
   if (!isVerified) {
     console.warn("[payment] Pago sin preaprobacion verificada; solo se guarda auditoria:", paymentId);
   } else {
-    const nextPaymentDate = asValidDate(verifiedSubscription?.next_payment_date);
+    const periodStart = asValidDate(result?.date_approved)
+      || asValidDate(result?.date_created)
+      || approvedDate;
+    const periodEnd = periodEndFromSubscription(
+      verifiedSubscription,
+      periodStart,
+      parsedBillingCycle
+    );
     const entitlement = await applySchoolEntitlement({
       db,
       schoolId: resolved.school._id,
@@ -1261,8 +1550,9 @@ async function updateSchoolFromPayment({
           attemptCreatedAt: resourceCreatedAt(verifiedSubscription),
         }
       ),
-      buildUpdate: (_school, decision) => {
+      buildUpdate: (school, decision) => {
         const entitlementUpdate = {
+          subscriptionEntitlementManaged: true,
           subscriptionStatus: decision.subscriptionStatus,
           mercadoPagoEntitlementUpdatedAt: paymentEventAt,
           mercadoPagoEntitlementExternalReference: externalReference,
@@ -1278,7 +1568,30 @@ async function updateSchoolFromPayment({
           updatedAt: new Date(),
         };
 
+        const revocation = entitlementRevocationFields(school, {
+          paymentId,
+          preapprovalId,
+          externalReference,
+          status: result?.status,
+          eventAt: paymentEventAt,
+        });
+        if (revocation) Object.assign(entitlementUpdate, revocation);
+
         if (result?.status === "approved" && isV2Reference(parsedReference)) {
+          const providerStatus = verifiedSubscription?.status === "canceled"
+            ? "cancelled"
+            : verifiedSubscription?.status || null;
+          const sameCurrentSubscription = String(
+            school?.mercadoPagoSubscriptionId ||
+              school?.mercadoPagoEntitlementPreapprovalId ||
+              ""
+          ) === String(preapprovalId || "");
+          const cancellationAlreadyRequested = Boolean(
+            (school?.subscriptionCancelAtPeriodEnd && sameCurrentSubscription) ||
+              providerStatus === "cancelled"
+          );
+          const providerPaused = providerStatus === "paused";
+
           if (parsedPlanId) entitlementUpdate.planName = parsedPlanId;
           if (parsedBillingCycle) entitlementUpdate.billingCycle = parsedBillingCycle;
           if (parsedReference?.extraStudents !== null
@@ -1286,8 +1599,35 @@ async function updateSchoolFromPayment({
             entitlementUpdate.extraStudents = parsedReference.extraStudents;
             entitlementUpdate.maxStudents = BASE_STUDENTS + parsedReference.extraStudents;
           }
-          if (preapprovalId) entitlementUpdate.mercadoPagoActiveSubscriptionId = preapprovalId;
-          if (nextPaymentDate) entitlementUpdate.subscriptionNextPaymentDate = nextPaymentDate;
+          if (preapprovalId) {
+            entitlementUpdate.mercadoPagoActiveSubscriptionId = preapprovalId;
+            entitlementUpdate.mercadoPagoSubscriptionId = preapprovalId;
+            entitlementUpdate.subscriptionLastSuccessfulPaymentPreapprovalId = preapprovalId;
+          }
+          entitlementUpdate.mercadoPagoExternalReference = externalReference;
+          entitlementUpdate.mercadoPagoSubscriptionStatus = providerStatus;
+          entitlementUpdate.mercadoPagoSubscriptionProviderModifiedAt =
+            resourceDate(verifiedSubscription, paymentEventAt);
+          entitlementUpdate.subscriptionActivatedAt =
+            school?.subscriptionActivatedAt || approvedDate;
+          entitlementUpdate.subscriptionCurrentPeriodStart = periodStart;
+          if (periodEnd) entitlementUpdate.subscriptionCurrentPeriodEnd = periodEnd;
+          entitlementUpdate.subscriptionNextPaymentDate =
+            cancellationAlreadyRequested || providerPaused ? null : periodEnd;
+          entitlementUpdate.subscriptionRenews =
+            !cancellationAlreadyRequested && !providerPaused;
+          entitlementUpdate.subscriptionCancelAtPeriodEnd = cancellationAlreadyRequested;
+          entitlementUpdate.subscriptionCancellationRequestedAt =
+            cancellationAlreadyRequested
+              ? school?.subscriptionCancellationRequestedAt || paymentEventAt
+              : null;
+          entitlementUpdate.subscriptionPaused = providerPaused;
+          entitlementUpdate.subscriptionPausedAt = providerPaused
+            ? school?.subscriptionPausedAt || paymentEventAt
+            : null;
+          entitlementUpdate.subscriptionCancelledAt = null;
+          entitlementUpdate.subscriptionLastSuccessfulPaymentId = String(paymentId);
+          entitlementUpdate.subscriptionLastSuccessfulPaymentAt = approvedDate;
           entitlementUpdate.LastAprovedPaymentDate = approvedDate;
           entitlementUpdate.LastAprovedAmount = result?.transaction_amount ?? null;
         }
@@ -1688,13 +2028,20 @@ async function workerRequest(request) {
 }
 
 export {
+  addCalendarMonths,
+  entitlementRevocationFields,
   entitlementDecisionFromPayment,
   entitlementDecisionFromPreapproval,
+  extractCheckoutDetails,
   extractBillingCycle,
+  hasPaidAccess,
   isVerifiedSubscriptionPayment,
   licenseStatusFromPayment,
   licenseStatusFromPreapproval,
+  mapSubscriptionStatus,
   parseExternalReference,
+  pauseTransitionFields,
+  periodEndFromSubscription,
 };
 
 export default {
@@ -1716,7 +2063,9 @@ export default {
         return workerJson({ received: true });
       } catch (error) {
         console.error("[webhook] Procesamiento no confirmado:", error.message);
-        return workerJson({ error: "No se pudo confirmar el procesamiento del webhook" }, 500);
+        // El 5xx fuerza el reintento de Mercado Pago. El claim con lease de
+        // main permite retomar el evento sin procesarlo dos veces en paralelo.
+        return workerJson({ error: "No se pudo confirmar el procesamiento del webhook" }, 503);
       }
     }
 
