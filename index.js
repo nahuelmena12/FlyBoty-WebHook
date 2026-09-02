@@ -183,6 +183,15 @@ async function getMongoDb() {
         mongoState.db
           .collection("schools")
           .createIndex({ mercadoPagoExternalReference: 1 }, { sparse: true }),
+        mongoState.db
+          .collection("mercadopago_subscription_attempts")
+          .createIndex({ subscriptionId: 1 }, { unique: true }),
+        mongoState.db
+          .collection("mercadopago_subscription_attempts")
+          .createIndex({ externalReference: 1, updatedAt: -1 }),
+        mongoState.db
+          .collection("mercadopago_subscription_attempts")
+          .createIndex({ schoolId: 1, updatedAt: -1 }),
       ]);
       mongoState.indexesReady = true;
     }
@@ -322,15 +331,42 @@ function extractSchoolIdFromExternalReference(externalReference) {
   return candidate;
 }
 
-// Extrae el planId del external_reference con formato "PLAN_ID_<24hexSchoolId>"
-function extractPlanIdFromExternalReference(externalReference) {
-  if (!externalReference) return null;
+const PLAN_IDS = ["LOW_COST", "STANDARD", "FULL"];
+
+// Formato actual: PLAN_CYCLE_EXTRAS_ATTEMPT_UUID_<24hexSchoolId>.
+// También acepta el formato histórico PLAN_<24hexSchoolId>.
+function extractCheckoutDetails(externalReference, reason) {
+  if (!externalReference) return {};
   const ref = String(externalReference);
   const schoolId = extractSchoolIdFromExternalReference(ref);
-  if (!schoolId) return null;
-  // planId es todo lo que está antes de "_<schoolId>"
-  const planId = ref.slice(0, ref.length - schoolId.length - 1);
-  return planId || null;
+  if (!schoolId || !ref.endsWith(`_${schoolId}`)) return {};
+  const body = ref.slice(0, -(schoolId.length + 1));
+  const planId = PLAN_IDS.find(
+    (candidate) => body === candidate || body.startsWith(`${candidate}_`)
+  );
+  if (!planId) return { schoolId };
+
+  const remainder = body === planId ? "" : body.slice(planId.length + 1);
+  const parts = remainder.split("_").filter(Boolean);
+  const cycleToken = parts[0]?.toLowerCase();
+  const billingCycle = ["monthly", "annual"].includes(cycleToken)
+    ? cycleToken
+    : extractBillingCycleFromReason(reason);
+  const extraCandidate = Number.parseInt(parts[1], 10);
+
+  return {
+    schoolId,
+    planId,
+    billingCycle,
+    extraStudents: Number.isInteger(extraCandidate) && extraCandidate >= 0
+      ? extraCandidate
+      : 0,
+    attemptId: parts.slice(2).join("_") || null,
+  };
+}
+
+function extractPlanIdFromExternalReference(externalReference) {
+  return extractCheckoutDetails(externalReference).planId || null;
 }
 
 // Deriva billingCycle del campo reason (ej: "FlyBoty LOW_COST · Anual")
@@ -345,16 +381,242 @@ function extractBillingCycleFromReason(reason) {
 function mapSubscriptionStatus(status) {
   switch (status) {
     case "authorized":
-      return "active";
+      // Autorización de débito no equivale a un pago acreditado.
+      return "pending";
     case "paused":
       return "paused";
     case "cancelled":
+    case "canceled":
       return "cancelled";
     case "pending":
       return "pending";
     default:
       return status || "inactive";
   }
+}
+
+function validDate(value) {
+  if (!value) return null;
+  const date = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function addCalendarMonths(value, months) {
+  const date = validDate(value);
+  if (!date) return null;
+  const result = new Date(date);
+  const originalDay = result.getUTCDate();
+  result.setUTCDate(1);
+  result.setUTCMonth(result.getUTCMonth() + months);
+  const lastDay = new Date(
+    Date.UTC(result.getUTCFullYear(), result.getUTCMonth() + 1, 0)
+  ).getUTCDate();
+  result.setUTCDate(Math.min(originalDay, lastDay));
+  return result;
+}
+
+function paidPeriodEnd(school) {
+  const canonical = validDate(school?.subscriptionCurrentPeriodEnd);
+  const paymentId = school?.subscriptionLastSuccessfulPaymentId;
+  const paidPreapprovalId =
+    school?.subscriptionLastSuccessfulPaymentPreapprovalId;
+  const currentPreapprovalId = school?.mercadoPagoSubscriptionId;
+  if (!canonical || !paymentId || !paidPreapprovalId || !currentPreapprovalId) {
+    return null;
+  }
+  return String(paidPreapprovalId) === String(currentPreapprovalId)
+    ? canonical
+    : null;
+}
+
+function hasPaidAccess(school, now = new Date()) {
+  const end = paidPeriodEnd(school);
+  return Boolean(end && end.getTime() > now.getTime());
+}
+
+function periodEndFromSubscription(preapproval, periodStart, billingCycle) {
+  const start = validDate(periodStart);
+  const frequency = Number(preapproval?.auto_recurring?.frequency);
+  if (
+    start &&
+    preapproval?.auto_recurring?.frequency_type === "months" &&
+    Number.isInteger(frequency) &&
+    frequency > 0
+  ) {
+    return addCalendarMonths(start, frequency);
+  }
+  return addCalendarMonths(start, billingCycle === "annual" ? 12 : 1);
+}
+
+const ENTITLEMENT_REVOKING_PAYMENT_STATUSES = new Set([
+  "refunded",
+  "charged_back",
+  "cancelled",
+  "canceled",
+]);
+
+function normalizePaymentStatus(status) {
+  return status === "canceled" ? "cancelled" : status || null;
+}
+
+function isEntitlementRevokingPaymentStatus(status) {
+  return ENTITLEMENT_REVOKING_PAYMENT_STATUSES.has(String(status || ""));
+}
+
+function entitlementRevocationFields(
+  school,
+  {
+    paymentId,
+    preapprovalId,
+    externalReference,
+    status,
+    eventAt,
+  } = {}
+) {
+  const normalizedStatus = normalizePaymentStatus(status);
+  if (!paymentId || !isEntitlementRevokingPaymentStatus(normalizedStatus)) {
+    return null;
+  }
+
+  const grantedPaymentId = school?.subscriptionLastSuccessfulPaymentId;
+  const grantedPreapprovalId =
+    school?.subscriptionLastSuccessfulPaymentPreapprovalId;
+  const currentPreapprovalId = school?.mercadoPagoSubscriptionId;
+  if (
+    !grantedPaymentId ||
+    String(grantedPaymentId) !== String(paymentId) ||
+    !grantedPreapprovalId ||
+    !currentPreapprovalId ||
+    String(grantedPreapprovalId) !== String(currentPreapprovalId) ||
+    (preapprovalId &&
+      String(preapprovalId) !== String(grantedPreapprovalId)) ||
+    (externalReference &&
+      school?.mercadoPagoExternalReference &&
+      String(externalReference) !==
+        String(school.mercadoPagoExternalReference))
+  ) {
+    return null;
+  }
+
+  const revokedAt = validDate(eventAt) || new Date();
+  return {
+    subscriptionEntitlementManaged: true,
+    subscriptionStatus: "cancelled",
+    subscriptionCurrentPeriodEnd: revokedAt,
+    subscriptionNextPaymentDate: null,
+    subscriptionCancelAtPeriodEnd: false,
+    subscriptionEntitlementRevokedAt: revokedAt,
+    subscriptionEntitlementRevocationStatus: normalizedStatus,
+    subscriptionEntitlementRevokedPaymentId: String(paymentId),
+    subscriptionEntitlementRevokedPreapprovalId: String(
+      grantedPreapprovalId
+    ),
+  };
+}
+
+function pauseTransitionFields(
+  school,
+  providerStatus,
+  { paidAccess = false, eventDate, receivedAt } = {}
+) {
+  const normalizedStatus =
+    providerStatus === "canceled" ? "cancelled" : providerStatus;
+  const providerModifiedAt = validDate(eventDate) || new Date();
+  const observedAt = validDate(receivedAt) || providerModifiedAt;
+  const currentProviderAt = validDate(
+    school?.mercadoPagoSubscriptionProviderModifiedAt
+  );
+  const wasPaused = Boolean(
+    school?.subscriptionPaused === true ||
+      school?.mercadoPagoSubscriptionStatus === "paused"
+  );
+  const isStrictlyNewer = Boolean(
+    !currentProviderAt ||
+      providerModifiedAt.getTime() > currentProviderAt.getTime()
+  );
+  const legacyPauseCancellation = Boolean(
+    wasPaused &&
+      school?.subscriptionCancelAtPeriodEnd === true &&
+      school?.mercadoPagoSubscriptionStatus === "paused"
+  );
+
+  if (normalizedStatus === "paused") {
+    return {
+      subscriptionStatus: paidAccess ? "active" : "paused",
+      subscriptionPaused: true,
+      subscriptionPausedAt:
+        validDate(school?.subscriptionPausedAt) || observedAt,
+      subscriptionRenews: false,
+      subscriptionNextPaymentDate: null,
+      ...(legacyPauseCancellation
+        ? {
+            subscriptionCancelAtPeriodEnd: false,
+            subscriptionCancellationRequestedAt: null,
+          }
+        : {}),
+    };
+  }
+
+  if (normalizedStatus === "authorized") {
+    // A snapshot authorized anterior (o con la misma versión temporal) no
+    // puede deshacer una pausa que ya fue observada.
+    if (wasPaused && !isStrictlyNewer) return null;
+    const renews =
+      paidAccess &&
+      !(school?.subscriptionCancelAtPeriodEnd && !legacyPauseCancellation);
+    return {
+      subscriptionStatus: paidAccess ? "active" : "pending",
+      subscriptionPaused: false,
+      subscriptionPausedAt: null,
+      subscriptionRenews: renews,
+      subscriptionNextPaymentDate: renews
+        ? paidPeriodEnd(school)
+        : null,
+      ...(legacyPauseCancellation
+        ? {
+            subscriptionCancelAtPeriodEnd: false,
+            subscriptionCancellationRequestedAt: null,
+          }
+        : {}),
+    };
+  }
+
+  return {};
+}
+
+async function upsertSubscriptionAttempt(db, {
+  subscriptionId,
+  externalReference,
+  reason,
+  status,
+  result,
+  schoolId,
+}) {
+  const details = extractCheckoutDetails(externalReference, reason);
+  const now = new Date();
+  await db.collection("mercadopago_subscription_attempts").updateOne(
+    { subscriptionId: String(subscriptionId) },
+    {
+      $set: {
+        schoolId: String(schoolId),
+        externalReference,
+        reason: reason || null,
+        status: status || null,
+        planId: details.planId || null,
+        billingCycle: details.billingCycle || null,
+        extraStudents: details.extraStudents ?? 0,
+        attemptId: details.attemptId || null,
+        nextPaymentDate: validDate(result?.next_payment_date),
+        frequency: result?.auto_recurring?.frequency ?? null,
+        frequencyType: result?.auto_recurring?.frequency_type ?? null,
+        providerLastModifiedAt: validDate(result?.last_modified),
+        updatedAt: now,
+      },
+      $setOnInsert: { createdAt: now },
+    },
+    { upsert: true }
+  );
+  return { ...details, subscriptionId: String(subscriptionId) };
 }
 
 function buildSchoolEventEntry({
@@ -377,6 +639,34 @@ function buildSchoolEventEntry({
     rawEventId: rawEventId || null,
     receivedAt,
   };
+}
+
+function revisionFilter(school) {
+  const revision = Number(school?.mercadoPagoStateRevision);
+  if (Number.isInteger(revision) && revision >= 0) {
+    return { mercadoPagoStateRevision: revision };
+  }
+  return { mercadoPagoStateRevision: { $exists: false } };
+}
+
+async function updateSchoolAtomically(db, schoolId, buildUpdate) {
+  const collection = db.collection("schools");
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    const school = await collection.findOne({ _id: schoolId });
+    if (!school) return null;
+    const update = await buildUpdate(school);
+    if (!update) return school;
+    update.$inc = {
+      ...(update.$inc || {}),
+      mercadoPagoStateRevision: 1,
+    };
+    const result = await collection.updateOne(
+      { _id: schoolId, ...revisionFilter(school) },
+      update
+    );
+    if (result.modifiedCount === 1) return school;
+  }
+  throw new Error("Conflicto actualizando el estado de la suscripción");
 }
 
 async function registerWebhookEvent({
@@ -408,6 +698,7 @@ async function registerWebhookEvent({
         sourceIp: context.sourceIp,
         receivedAt: context.receivedAt,
         processingState,
+        processingStartedAt: new Date(),
         notes: notes || null,
         createdAt: new Date(),
         updatedAt: new Date(),
@@ -422,9 +713,32 @@ async function registerWebhookEvent({
     { upsert: true }
   );
 
-  return {
-    inserted: result.upsertedCount === 1,
-  };
+  if (result.upsertedCount === 1) return { inserted: true, retry: false };
+
+  // A processing failure must be retryable. The previous implementation made
+  // the unique event key permanently suppress every Mercado Pago retry.
+  const staleProcessingCutoff = new Date(Date.now() - 5 * 60 * 1000);
+  const retryClaim = await collection.updateOne(
+    {
+      eventKey: context.eventKey,
+      $or: [
+        { processingState: "processing_error" },
+        {
+          processingState: "received",
+          processingStartedAt: { $lt: staleProcessingCutoff },
+        },
+      ],
+    },
+    {
+      $set: {
+        processingState: "received",
+        processingStartedAt: new Date(),
+        notes: "Retrying after processing_error",
+        updatedAt: new Date(),
+      },
+    }
+  );
+  return { inserted: retryClaim.modifiedCount === 1, retry: retryClaim.modifiedCount === 1 };
 }
 
 async function finalizeWebhookEvent({
@@ -478,41 +792,178 @@ async function updateSchoolFromSubscription({
     return null;
   }
 
-  const eventDate = result?.last_modified || result?.date_created || new Date();
+  const eventDate =
+    validDate(result?.last_modified || result?.date_created) || new Date();
   const receivedAt = new Date();
   const db = await getMongoDb();
+  const providerStatus = result?.status || null;
+  const normalizedProviderStatus =
+    providerStatus === "canceled" ? "cancelled" : providerStatus;
+  const attempt = await upsertSubscriptionAttempt(db, {
+    subscriptionId,
+    externalReference,
+    reason: result?.reason,
+    status: normalizedProviderStatus,
+    result,
+    schoolId: resolved.schoolId,
+  });
+  await updateSchoolAtomically(db, resolved.school._id, (school) => {
+    const currentSubscriptionId = school?.mercadoPagoSubscriptionId
+      ? String(school.mercadoPagoSubscriptionId)
+      : null;
+    const isCurrentSubscription =
+      currentSubscriptionId === String(subscriptionId);
+    const paidAccessIsCurrent = hasPaidAccess(school, receivedAt);
+    const currentProviderAt = validDate(
+      school?.mercadoPagoSubscriptionProviderModifiedAt
+    );
+    const currentSubscriptionCreatedAt = validDate(
+      school?.mercadoPagoCurrentSubscriptionCreatedAt
+    );
+    const providerCreatedAt = validDate(result?.date_created) || eventDate;
+    const staleCurrentSnapshot = Boolean(
+      isCurrentSubscription &&
+        currentProviderAt &&
+        eventDate.getTime() < currentProviderAt.getTime()
+    );
+    const olderDifferentCheckout = Boolean(
+      currentSubscriptionId &&
+        !isCurrentSubscription &&
+        currentSubscriptionCreatedAt &&
+        providerCreatedAt.getTime() <= currentSubscriptionCreatedAt.getTime()
+    );
 
-  const parsedPlanId = extractPlanIdFromExternalReference(externalReference);
-  const parsedBillingCycle = extractBillingCycleFromReason(result?.reason);
-  const nextPaymentDate = result?.next_payment_date
-    ? new Date(result.next_payment_date)
-    : result?.auto_recurring?.end_date
-    ? new Date(result.auto_recurring.end_date)
-    : null;
+    const entitlementFields = {};
+    if (!staleCurrentSnapshot && !paidAccessIsCurrent) {
+      // Un mandato pending/authorized no compra acceso. Sólo seleccionamos el
+      // intento más nuevo; la activación ocurre con una factura approved.
+      if (
+        ["pending", "authorized"].includes(normalizedProviderStatus) &&
+        !olderDifferentCheckout
+      ) {
+        const transition = pauseTransitionFields(
+          school,
+          normalizedProviderStatus,
+          {
+            paidAccess: false,
+            eventDate,
+            receivedAt,
+          }
+        );
+        if (transition !== null) {
+          Object.assign(entitlementFields, {
+            subscriptionEntitlementManaged: true,
+            subscriptionStatus: "pending",
+            mercadoPagoSubscriptionId: String(subscriptionId),
+            mercadoPagoExternalReference: externalReference,
+            mercadoPagoSubscriptionStatus: normalizedProviderStatus,
+            mercadoPagoSubscriptionReason: result?.reason || null,
+            mercadoPagoSubscriptionProviderModifiedAt: eventDate,
+            mercadoPagoCurrentSubscriptionCreatedAt: providerCreatedAt,
+            subscriptionRenews: false,
+            subscriptionCancelAtPeriodEnd: false,
+            ...transition,
+          });
+        }
+      } else if (
+        normalizedProviderStatus === "paused" &&
+        (isCurrentSubscription || !currentSubscriptionId)
+      ) {
+        Object.assign(entitlementFields, {
+          subscriptionEntitlementManaged: true,
+          mercadoPagoSubscriptionStatus: normalizedProviderStatus,
+          mercadoPagoSubscriptionProviderModifiedAt: eventDate,
+          subscriptionCancelAtPeriodEnd: false,
+          ...(pauseTransitionFields(school, normalizedProviderStatus, {
+            paidAccess: false,
+            eventDate,
+            receivedAt,
+          }) || {}),
+        });
+      } else if (
+        normalizedProviderStatus === "cancelled" &&
+        (isCurrentSubscription || !currentSubscriptionId)
+      ) {
+        Object.assign(entitlementFields, {
+          subscriptionEntitlementManaged: true,
+          subscriptionStatus: "cancelled",
+          mercadoPagoSubscriptionStatus: normalizedProviderStatus,
+          mercadoPagoSubscriptionProviderModifiedAt: eventDate,
+          subscriptionRenews: false,
+          subscriptionCancelAtPeriodEnd: false,
+          subscriptionCancelledAt: receivedAt,
+          subscriptionNextPaymentDate: null,
+        });
+      }
+    } else if (
+      !staleCurrentSnapshot &&
+      paidAccessIsCurrent &&
+      isCurrentSubscription
+    ) {
+      const providerFields = {
+        subscriptionEntitlementManaged: true,
+        mercadoPagoSubscriptionStatus: normalizedProviderStatus,
+        mercadoPagoSubscriptionReason: result?.reason || null,
+        mercadoPagoSubscriptionProviderModifiedAt: eventDate,
+      };
+      if (normalizedProviderStatus === "paused") {
+        Object.assign(
+          entitlementFields,
+          providerFields,
+          pauseTransitionFields(school, normalizedProviderStatus, {
+            paidAccess: true,
+            eventDate,
+            receivedAt,
+          }) || {}
+        );
+      } else if (normalizedProviderStatus === "cancelled") {
+        Object.assign(entitlementFields, {
+          ...providerFields,
+          subscriptionStatus: "active",
+          subscriptionRenews: false,
+          subscriptionCancelAtPeriodEnd: true,
+          subscriptionCancellationRequestedAt:
+            school?.subscriptionCancellationRequestedAt || receivedAt,
+          subscriptionNextPaymentDate: null,
+        });
+      } else if (normalizedProviderStatus === "authorized") {
+        // Nunca copiar next_payment_date al período de acceso. Sólo un pago
+        // aprobado puede extender subscriptionCurrentPeriodEnd.
+        const transition = pauseTransitionFields(
+          school,
+          normalizedProviderStatus,
+          { paidAccess: true, eventDate, receivedAt }
+        );
+        if (transition !== null) {
+          Object.assign(entitlementFields, providerFields, transition);
+        }
+      }
+    }
 
-  const planFields = {};
-  if (parsedPlanId) planFields.planName = parsedPlanId;
-  if (parsedBillingCycle) planFields.billingCycle = parsedBillingCycle;
-  if (nextPaymentDate) planFields.subscriptionNextPaymentDate = nextPaymentDate;
-
-  await db.collection("schools").updateOne(
-    { _id: resolved.school._id },
-    {
+    return {
       $set: {
-        mercadoPagoExternalReference: externalReference,
         mercadoPagoSchoolId: resolved.schoolId,
         mercadoPagoPayerEmail:
-          result?.payer_email || resolved.school?.mercadoPagoPayerEmail || null,
+          result?.payer_email || school?.mercadoPagoPayerEmail || null,
         mercadoPagoLastWebhookAt: receivedAt,
         mercadoPagoLastEventType: context.payloadType,
         mercadoPagoLastEventAction: context.action,
-        mercadoPagoSubscriptionId: subscriptionId,
-        mercadoPagoSubscriptionStatus: result?.status || null,
-        mercadoPagoSubscriptionReason: result?.reason || null,
-        mercadoPagoSubscriptionVersion: context.version,
+        mercadoPagoLastSubscriptionId: String(subscriptionId),
+        mercadoPagoLastSubscriptionStatus: normalizedProviderStatus,
+        mercadoPagoLastSubscriptionExternalReference: externalReference,
+        mercadoPagoLastSubscriptionVersion: String(result?.version ?? context.version),
+        mercadoPagoCheckout: {
+          subscriptionId: String(subscriptionId),
+          status: normalizedProviderStatus,
+          externalReference,
+          planName: attempt.planId || null,
+          billingCycle: attempt.billingCycle || null,
+          extraStudents: attempt.extraStudents ?? 0,
+          attemptId: attempt.attemptId || null,
+          updatedAt: receivedAt,
+        },
         mercadoPagoSubscriptionLastEventAt: new Date(eventDate),
-        subscriptionStatus: mapSubscriptionStatus(result?.status),
-        ...planFields,
+        ...entitlementFields,
         updatedAt: new Date(),
       },
       $push: {
@@ -522,7 +973,7 @@ async function updateSchoolFromSubscription({
               sourceType: context.payloadType,
               sourceId: subscriptionId,
               action: context.action,
-              status: result?.status,
+              status: normalizedProviderStatus,
               externalReference,
               receivedAt,
               rawEventId: context.notificationId,
@@ -531,8 +982,8 @@ async function updateSchoolFromSubscription({
           $slice: -30,
         },
       },
-    }
-  );
+    };
+  });
 
   return resolved.schoolId;
 }
@@ -553,42 +1004,51 @@ async function updateSchoolFromPayment({
   }
 
   const receivedAt = new Date();
-  const isApproved = result?.status === "approved";
-  const approvedDate = result?.date_approved
-    ? new Date(result.date_approved)
-    : receivedAt;
+  const paymentEventAt =
+    validDate(
+      result?.date_last_updated ||
+        result?.date_approved ||
+        result?.date_created
+    ) || receivedAt;
+  const db = await getMongoDb();
+  await updateSchoolAtomically(db, resolved.school._id, (school) => {
+    const previousPaymentEventAt = validDate(
+      school?.mercadoPagoLastPaymentEventAt
+    );
+    const isLatestPaymentEvent =
+      !previousPaymentEventAt ||
+      paymentEventAt.getTime() >= previousPaymentEventAt.getTime();
+    const latestPaymentFields = isLatestPaymentEvent
+      ? {
+          mercadoPagoPayerEmail:
+            result?.payer?.email || school?.mercadoPagoPayerEmail || null,
+          mercadoPagoLastPaymentId: String(paymentId),
+          mercadoPagoLastPaymentStatus: result?.status || null,
+          mercadoPagoLastPaymentStatusDetail: result?.status_detail || null,
+          mercadoPagoLastPaymentAmount: result?.transaction_amount ?? null,
+          mercadoPagoLastPaymentCurrency: result?.currency_id || null,
+          mercadoPagoLastPaymentDateCreated: validDate(result?.date_created),
+          mercadoPagoLastPaymentDateApproved: validDate(result?.date_approved),
+          mercadoPagoLastPaymentEventAt: paymentEventAt,
+        }
+      : {};
+    const revocationFields = entitlementRevocationFields(school, {
+      paymentId,
+      externalReference,
+      status: result?.status,
+      eventAt: paymentEventAt,
+    });
 
-  const update = {
-    mercadoPagoExternalReference: externalReference,
-    mercadoPagoSchoolId: resolved.schoolId,
-    mercadoPagoPayerEmail:
-      result?.payer?.email || resolved.school?.mercadoPagoPayerEmail || null,
-    mercadoPagoLastWebhookAt: receivedAt,
-    mercadoPagoLastEventType: context.payloadType,
-    mercadoPagoLastEventAction: context.action,
-    mercadoPagoLastPaymentId: String(paymentId),
-    mercadoPagoLastPaymentStatus: result?.status || null,
-    mercadoPagoLastPaymentStatusDetail: result?.status_detail || null,
-    mercadoPagoLastPaymentAmount: result?.transaction_amount ?? null,
-    mercadoPagoLastPaymentCurrency: result?.currency_id || null,
-    mercadoPagoLastPaymentDateCreated: result?.date_created
-      ? new Date(result.date_created)
-      : null,
-    mercadoPagoLastPaymentDateApproved: result?.date_approved
-      ? new Date(result.date_approved)
-      : null,
-    updatedAt: new Date(),
-  };
-
-  if (isApproved) {
-    update.LastAprovedPaymentDate = approvedDate;
-    update.LastAprovedAmount = result?.transaction_amount ?? null;
-  }
-
-  await (await getMongoDb()).collection("schools").updateOne(
-    { _id: resolved.school._id },
-    {
-      $set: update,
+    return {
+      $set: {
+        mercadoPagoSchoolId: resolved.schoolId,
+        mercadoPagoLastWebhookAt: receivedAt,
+        mercadoPagoLastEventType: context.payloadType,
+        mercadoPagoLastEventAction: context.action,
+        ...latestPaymentFields,
+        ...(revocationFields || {}),
+        updatedAt: receivedAt,
+      },
       $push: {
         mercadoPagoEventHistory: {
           $each: [
@@ -606,8 +1066,8 @@ async function updateSchoolFromPayment({
           $slice: -30,
         },
       },
-    }
-  );
+    };
+  });
 
   return resolved.schoolId;
 }
@@ -615,12 +1075,23 @@ async function updateSchoolFromPayment({
 async function updateSchoolFromAuthorizedPayment({
   authorizedPaymentId,
   result,
+  preapproval,
+  payment,
   context,
 }) {
   const externalReference =
+    preapproval?.external_reference ||
+    payment?.external_reference ||
     result?.external_reference ||
     result?.metadata?.external_reference ||
     result?.reason;
+  if (
+    preapproval?.external_reference &&
+    payment?.external_reference &&
+    preapproval.external_reference !== payment.external_reference
+  ) {
+    throw new Error("La factura no pertenece al preapproval informado");
+  }
   const resolved = await findSchoolByExternalReference(externalReference);
 
   if (!resolved) {
@@ -631,24 +1102,201 @@ async function updateSchoolFromAuthorizedPayment({
   }
 
   const receivedAt = new Date();
+  const db = await getMongoDb();
+  const subscriptionId = result?.preapproval_id || preapproval?.id || null;
+  const providerStatusRaw = preapproval?.status || null;
+  const providerStatus = providerStatusRaw === "canceled" ? "cancelled" : providerStatusRaw;
+  let attempt = null;
+  if (subscriptionId) {
+    attempt = await upsertSubscriptionAttempt(db, {
+      subscriptionId,
+      externalReference,
+      reason: preapproval?.reason || result?.reason,
+      status: providerStatus,
+      result: preapproval || result,
+      schoolId: resolved.schoolId,
+    });
+  }
+  const nestedPaymentStatus = payment?.status || result?.payment?.status || null;
+  const nestedPaymentId = payment?.id
+    ? String(payment.id)
+    : result?.payment?.id
+      ? String(result.payment.id)
+      : null;
+  const isApproved = nestedPaymentStatus === "approved";
+  const approvedAt =
+    validDate(payment?.date_approved) ||
+    validDate(result?.date_created) ||
+    receivedAt;
+  const periodStart =
+    validDate(result?.debit_date) || validDate(payment?.date_created) || approvedAt;
+  const details = extractCheckoutDetails(
+    externalReference,
+    preapproval?.reason || result?.reason
+  );
+  const billingCycle = attempt?.billingCycle || details.billingCycle || "monthly";
+  const periodEnd = periodEndFromSubscription(
+    preapproval,
+    periodStart,
+    billingCycle
+  );
 
-  await (await getMongoDb()).collection("schools").updateOne(
-    { _id: resolved.school._id },
-    {
+  await updateSchoolAtomically(db, resolved.school._id, (school) => {
+    const currentSubscriptionId = school?.mercadoPagoSubscriptionId
+      ? String(school.mercadoPagoSubscriptionId)
+      : null;
+    const sameCurrentSubscription = Boolean(
+      subscriptionId && currentSubscriptionId === String(subscriptionId)
+    );
+    const providerCreatedAt =
+      validDate(preapproval?.date_created) || approvedAt;
+    const currentSubscriptionCreatedAt = validDate(
+      school?.mercadoPagoCurrentSubscriptionCreatedAt ||
+        school?.subscriptionActivatedAt ||
+        school?.LastAprovedPaymentDate
+    );
+    const belongsToNewestSubscription = Boolean(
+      subscriptionId &&
+        (!currentSubscriptionId ||
+          sameCurrentSubscription ||
+          !currentSubscriptionCreatedAt ||
+          providerCreatedAt.getTime() > currentSubscriptionCreatedAt.getTime())
+    );
+    const previousApprovedAt = validDate(
+      school?.subscriptionLastSuccessfulPaymentAt ||
+        school?.LastAprovedPaymentDate
+    );
+    const sameSuccessfulPayment = Boolean(
+      nestedPaymentId &&
+        String(school?.subscriptionLastSuccessfulPaymentId || "") ===
+          nestedPaymentId
+    );
+    const isNewestInvoice = Boolean(
+      sameSuccessfulPayment ||
+        !previousApprovedAt ||
+        approvedAt.getTime() >= previousApprovedAt.getTime()
+    );
+    const shouldPromotePayment = Boolean(
+      isApproved &&
+        nestedPaymentId &&
+        subscriptionId &&
+        periodEnd &&
+        periodEnd.getTime() > receivedAt.getTime() &&
+        belongsToNewestSubscription &&
+        isNewestInvoice
+    );
+    const entitlementFields =
+      entitlementRevocationFields(school, {
+        paymentId: nestedPaymentId,
+        preapprovalId: subscriptionId,
+        externalReference,
+        status: nestedPaymentStatus,
+        eventAt:
+          payment?.date_last_updated ||
+          payment?.date_approved ||
+          result?.date_created ||
+          receivedAt,
+      }) || {};
+
+    if (shouldPromotePayment) {
+      const providerPaused = providerStatus === "paused";
+      const cancellationAlreadyRequested = Boolean(
+        (school?.subscriptionCancelAtPeriodEnd && sameCurrentSubscription) ||
+          providerStatus === "cancelled"
+      );
+      const resolvedExtraStudents = sameCurrentSubscription
+        ? Number(school?.extraStudents ?? attempt?.extraStudents ?? 0)
+        : Number(attempt?.extraStudents ?? details.extraStudents ?? 0);
+      Object.assign(entitlementFields, {
+        subscriptionEntitlementManaged: true,
+        subscriptionStatus: "active",
+        subscriptionActivatedAt: school?.subscriptionActivatedAt || approvedAt,
+        subscriptionCurrentPeriodStart: periodStart,
+        subscriptionCurrentPeriodEnd: periodEnd,
+        subscriptionNextPaymentDate:
+          cancellationAlreadyRequested || providerPaused
+          ? null
+          : periodEnd,
+        subscriptionRenews:
+          !cancellationAlreadyRequested && !providerPaused,
+        subscriptionCancelAtPeriodEnd: cancellationAlreadyRequested,
+        subscriptionCancellationRequestedAt: cancellationAlreadyRequested
+          ? school?.subscriptionCancellationRequestedAt || receivedAt
+          : null,
+        subscriptionCancelledAt: null,
+        subscriptionPaused: providerPaused,
+        subscriptionPausedAt: providerPaused
+          ? school?.subscriptionPausedAt || receivedAt
+          : null,
+        subscriptionLastSuccessfulPaymentId: nestedPaymentId,
+        subscriptionLastSuccessfulPaymentPreapprovalId: String(subscriptionId),
+        subscriptionLastSuccessfulPaymentAt: approvedAt,
+        LastAprovedPaymentDate: approvedAt,
+        LastAprovedAmount:
+          payment?.transaction_amount ?? result?.transaction_amount ?? null,
+        mercadoPagoLastPaymentId: nestedPaymentId,
+        mercadoPagoLastPaymentStatus: nestedPaymentStatus,
+        mercadoPagoLastPaymentStatusDetail:
+          payment?.status_detail || result?.payment?.status_detail || null,
+        mercadoPagoLastPaymentAmount:
+          payment?.transaction_amount ?? result?.transaction_amount ?? null,
+        mercadoPagoLastPaymentCurrency:
+          payment?.currency_id || result?.currency_id || null,
+        mercadoPagoLastPaymentDateCreated:
+          validDate(payment?.date_created) || periodStart,
+        mercadoPagoLastPaymentDateApproved: approvedAt,
+        mercadoPagoLastPaymentEventAt: approvedAt,
+        mercadoPagoExternalReference: externalReference,
+        mercadoPagoSubscriptionId: String(subscriptionId),
+        mercadoPagoSubscriptionStatus: providerStatus || "authorized",
+        mercadoPagoSubscriptionReason:
+          preapproval?.reason || result?.reason || null,
+        mercadoPagoSubscriptionProviderModifiedAt:
+          validDate(preapproval?.last_modified) || receivedAt,
+        mercadoPagoCurrentSubscriptionCreatedAt: providerCreatedAt,
+        planName:
+          attempt?.planId || details.planId || school?.planName || null,
+        billingCycle,
+        extraStudents: resolvedExtraStudents,
+        maxStudents: 50 + resolvedExtraStudents,
+      });
+    }
+
+    const previousAuthorizedEventAt = validDate(
+      school?.mercadoPagoLastAuthorizedPaymentEventAt
+    );
+    const authorizedEventAt =
+      validDate(result?.date_created) || approvedAt || receivedAt;
+    const latestAuthorizedFields =
+      !previousAuthorizedEventAt ||
+      authorizedEventAt.getTime() >= previousAuthorizedEventAt.getTime()
+        ? {
+            mercadoPagoLastAuthorizedPaymentId: String(authorizedPaymentId),
+            mercadoPagoLastAuthorizedPaymentStatus:
+              result?.status ||
+              result?.status_detail ||
+              nestedPaymentStatus ||
+              "received",
+            mercadoPagoLastAuthorizedPaymentDate: authorizedEventAt,
+            mercadoPagoLastAuthorizedPaymentEventAt: authorizedEventAt,
+            mercadoPagoLastAuthorizedPaymentPreapprovalId: subscriptionId
+              ? String(subscriptionId)
+              : null,
+            mercadoPagoLastAuthorizedPaymentPaymentId: nestedPaymentId,
+            mercadoPagoLastAuthorizedPaymentPaymentStatus:
+              nestedPaymentStatus,
+          }
+        : {};
+
+    return {
       $set: {
-        mercadoPagoExternalReference:
-          externalReference || resolved.school?.mercadoPagoExternalReference || null,
         mercadoPagoSchoolId: resolved.schoolId,
         mercadoPagoLastWebhookAt: receivedAt,
         mercadoPagoLastEventType: context.payloadType,
         mercadoPagoLastEventAction: context.action,
-        mercadoPagoLastAuthorizedPaymentId: String(authorizedPaymentId),
-        mercadoPagoLastAuthorizedPaymentStatus:
-          result?.status || result?.status_detail || "received",
-        mercadoPagoLastAuthorizedPaymentDate: result?.date_created
-          ? new Date(result.date_created)
-          : receivedAt,
-        updatedAt: new Date(),
+        ...latestAuthorizedFields,
+        ...entitlementFields,
+        updatedAt: receivedAt,
       },
       $push: {
         mercadoPagoEventHistory: {
@@ -666,8 +1314,8 @@ async function updateSchoolFromAuthorizedPayment({
           $slice: -30,
         },
       },
-    }
-  );
+    };
+  });
 
   return resolved.schoolId;
 }
@@ -733,6 +1381,12 @@ async function handleSubscriptionEvent(id, context) {
 
 async function handleAuthorizedPaymentEvent(id, context) {
   const result = await mercadoPagoGet(`/authorized_payments/${id}`);
+  const preapproval = result?.preapproval_id
+    ? await mercadoPagoGet(`/preapproval/${result.preapproval_id}`)
+    : null;
+  const payment = result?.payment?.id
+    ? await mercadoPagoGet(`/v1/payments/${result.payment.id}`)
+    : null;
 
   console.log("[authorized_payment] ID:", id);
   console.log(
@@ -747,6 +1401,8 @@ async function handleAuthorizedPaymentEvent(id, context) {
   return updateSchoolFromAuthorizedPayment({
     authorizedPaymentId: id,
     result,
+    preapproval,
+    payment,
     context,
   });
 }
@@ -855,6 +1511,7 @@ async function processWebhook(req) {
     } catch (auditErr) {
       console.error("[webhook] Error guardando auditoria:", auditErr.message);
     }
+    throw err;
   }
 }
 
@@ -943,10 +1600,14 @@ export default {
     if (request.method === "POST" && url.pathname === "/webhook/mercadopago") {
       const parsed = await workerRequest(request);
       if (parsed.error) return parsed.error;
-      // Mercado Pago only needs an acknowledgement. Keep the database/API work
-      // alive after responding, so retries are not caused by normal processing time.
-      ctx.waitUntil(processWebhook(parsed.req));
-      return workerJson({ received: true });
+      try {
+        await processWebhook(parsed.req);
+        return workerJson({ received: true });
+      } catch (_error) {
+        // El 5xx hace que Mercado Pago reintente; el evento quedó marcado como
+        // processing_error y puede ser reclamado de forma idempotente.
+        return workerJson({ error: "No se pudo procesar el webhook" }, 503);
+      }
     }
 
     if (request.method === "GET" && url.pathname === "/health") {
@@ -956,4 +1617,14 @@ export default {
 
     return workerJson({ error: "Ruta no encontrada" }, 404);
   },
+};
+
+export {
+  addCalendarMonths,
+  entitlementRevocationFields,
+  extractCheckoutDetails,
+  hasPaidAccess,
+  mapSubscriptionStatus,
+  pauseTransitionFields,
+  periodEndFromSubscription,
 };
